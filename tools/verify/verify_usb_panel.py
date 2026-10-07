@@ -74,25 +74,41 @@ class ConcurrentBench(usb_host.Bench):
                     reply.put_nowait(line)
         except BaseException as exc:self._fail(exc)
     def cmd(self,line,expect=None,timeout=None):
-        prefix=expect or line.split()[0]
-        assert prefix in {'ok','poke','call',*(f'{direction} {ep}' for direction in ('in','out') for ep in range(4))},prefix
-        guard=self.bench_lock if line.split()[0] in ('poke','call') else contextlib.nullcontext()
+        return self.cmd_batch(((line,expect or line.split()[0]),),timeout)[0]
+    def cmd_batch(self,commands,timeout=None):
+        """Reserve one command or the ISO IN/OUT pair, then send once.
+
+        Both replies share one deadline and remain reserved until the whole
+        batch completes. Only the reader thread receives from the socket.
+        """
+        assert 1<=len(commands)<=2,'bench batch must contain one or two commands'
+        prefixes=[prefix for _,prefix in commands]
+        assert len(set(prefixes))==len(prefixes),('duplicate pending response prefix',prefixes)
+        allowed={'ok','poke','call',*(f'{direction} {ep}' for direction in ('in','out') for ep in range(4))}
+        assert all(prefix in allowed for prefix in prefixes),prefixes
+        if len(commands)==2:assert set(prefixes)=={'in 3','out 3'},prefixes
+        guard=self.bench_lock if any(line.split()[0] in ('poke','call') for line,_ in commands) else contextlib.nullcontext()
         with guard:
-            reply=queue.Queue(maxsize=1)
+            replies={prefix:queue.Queue(maxsize=1) for prefix in prefixes}
             with self.lock:
                 if self.error is not None:raise self.error
-                assert prefix not in self.pending,('duplicate pending response prefix',prefix)
-                self.pending[prefix]=reply
+                assert not self.pending.keys() & replies.keys(),('duplicate pending response prefix',prefixes)
+                self.pending.update(replies)
             try:
-                with self.send_lock:self.sock.sendall(line.encode()+b'\n')
-                try:result=reply.get(timeout=timeout or self.timeout)
-                except queue.Empty:
-                    error=TimeoutError('no concurrent bench reply for '+prefix)
-                    self._fail(error);raise error
-                if isinstance(result,BaseException):raise result
-                return result
+                deadline=time.monotonic()+(timeout or self.timeout)
+                with self.send_lock:self.sock.sendall(''.join(line+'\n' for line,_ in commands).encode())
+                results=[]
+                for prefix,reply in replies.items():
+                    try:result=reply.get(timeout=max(0,deadline-time.monotonic()))
+                    except queue.Empty:raise TimeoutError('no concurrent bench reply for '+prefix)
+                    if isinstance(result,BaseException):raise result
+                    results.append(result)
+                return results
+            except BaseException as exc:
+                self._fail(exc);raise
             finally:
-                with self.lock:self.pending.pop(prefix,None)
+                with self.lock:
+                    for prefix in prefixes:self.pending.pop(prefix,None)
     def try_pokes(self,items):
         # A pending borrowed call needs ISO polls to reach main; never block
         # the ISO worker behind that call just to refresh synthetic markers.
@@ -107,6 +123,47 @@ class ConcurrentBench(usb_host.Bench):
         except OSError:pass
         self.sock.close();self.reader.join(timeout=2)
         assert not self.reader.is_alive(),'bench reader did not stop'
+
+
+class IsoCycle:
+    """One modeled ISO tick; duplex OUT follows the preceding IN size.
+
+    As in verify_usb_in, the first HS bInterval2 packet contains 11 frames.
+    Submitting both tokens together lets the model service them on one tick.
+    """
+    def __init__(self,bench,output_channels,input_channels=0):
+        self.bench=bench;self.output_channels=output_channels;self.input_channels=input_channels
+        self.input_frame=0;self.last_n=11
+    def prime(self,consume):
+        """Wait for deferred OUT activation using at most 16 IN-only polls.
+
+        SET_INTERFACE records in_alt; state7 later arms OUT. Two observed
+        state7 visits ensure the first visit's in_up has finished. Priming
+        packets still count toward the existing 80-poll startup allowance.
+        """
+        if not self.input_channels:return 0
+        def frames():return struct.unpack('>15I',self.bench.ctrl_in(0xc0,0x56,0,0,60))[9]
+        before=frames()
+        for polls in range(1,17):
+            packet=self.bench.ep_in(3,1024);consume(packet)
+            assert len(packet)%(4*self.output_channels)==0,'partial ISO IN frame'
+            self.last_n=len(packet)//(4*self.output_channels)
+            if frames()-before>=2:return polls
+        raise AssertionError('input state7 did not complete startup within16polls')
+    def __call__(self):
+        if not self.input_channels:return self.bench.ep_in(3,1024)
+        payload=b''.join(struct.pack('<I',((ch<<20)|((self.input_frame+j)&0xfffff))<<8)
+                         for j in range(self.last_n) for ch in range(self.input_channels))
+        incoming,outgoing=self.bench.cmd_batch((('in 3 1024','in 3'),(f'out 3 {payload.hex()}'.rstrip(),'out 3')))
+        parts_in=incoming.split();parts_out=outgoing.split()
+        if len(parts_in)>2 and parts_in[2]=='stall':raise usb_host.Stall('EP3 IN stalled')
+        if parts_out[2]=='stall':raise usb_host.Stall('EP3 OUT stalled')
+        assert int(parts_out[2])==len(payload),'short ISO OUT packet'
+        packet=bytes.fromhex(parts_in[2]) if len(parts_in)>2 else b''
+        assert len(packet)%(4*self.output_channels)==0,'partial ISO IN frame'
+        self.input_frame+=self.last_n
+        self.last_n=len(packet)//(4*self.output_channels)
+        return packet
 
 
 class IsoWorker:
@@ -161,14 +218,21 @@ class AudioPhase:
     packets; nonzero unrecognized words and empty USB packets fail immediately
     after a declared settling interval.
     """
-    def __init__(self,name,expected,settle=0):
-        self.name=name;self.expected=expected;self.settle=settle
-        self.polls=0;self.hits=[0]*len(expected);self.blank=[0]*len(expected)
+    def __init__(self,name,expected,settle=0,fs=False):
+        self.name=name;self.expected=expected;self.settle=settle;self.fs=fs
+        self.polls=0;self.frames=0;self.hits=[0]*len(expected);self.blank=[0]*len(expected)
     def feed(self,packet):
         self.polls+=1
         assert len(packet)%(4*len(self.expected))==0,(self.name,'partial audio frame')
         if self.polls<=self.settle:return
         assert packet,(self.name,'empty audio packet')
+        frames=len(packet)//(4*len(self.expected));self.frames+=frames
+        if self.fs:
+            # STEP_FS44100 +/- SERVO_MAX200, accumulator0..999. These
+            # bounds come from the builder, independently of observed tags.
+            assert 43<=frames<=45,(self.name,'FS packet frames',frames)
+            packets=self.polls-self.settle
+            assert 43900*packets//1000<=self.frames<=(44300*packets+999)//1000,(self.name,'FS cadence',packets,self.frames)
         hits=[0]*len(self.expected)
         for i in range(0,len(packet),4):
             word=int.from_bytes(packet[i:i+4],'little');channel=i//4%len(self.expected)
@@ -179,7 +243,7 @@ class AudioPhase:
             assert self.blank[channel]<=8,(self.name,'sustained unidentifiable/silent channel',channel)
     def finish(self):
         assert min(self.hits)>100,(self.name,'insufficient identifiable audio',self.hits)
-        return dict(phase=self.name,polls=self.polls,hits=list(self.hits))
+        return dict(phase=self.name,polls=self.polls,measured_polls=self.polls-self.settle,frames=self.frames,hits=list(self.hits))
 
 
 def uart_at_generation(raw_uart,final_generation,frozen_generation):
@@ -211,27 +275,36 @@ def check_audio_fixture(selectors,state):
         assert values==(0,0x7fffffff,0,0),('CF delay did not reach bypass',track,values)
 
 
-def check_counter_interval(before,after,baseline_before,baseline_after,hs):
+def check_counter_interval(before,after,hs,host_frames):
     keys=('produced','consumed','underruns','overruns','bankdup','reprimes')
     delta={key:after[key]-before[key] for key in keys}
-    baseline={key:baseline_after[key]-baseline_before[key] for key in keys}
     assert delta['produced']>0 and delta['consumed']>0,delta
+    assert delta['produced']%16==0,delta
+    assert before['anchor']==after['anchor'],('stream anchor changed',before,after)
     assert all(delta[key]==0 for key in ('overruns','bankdup','reprimes')),delta
     if hs:assert delta['underruns']==0,delta
     else:
-        # audio_pkt_build increments this counter on a speculative short
-        # build (source line633), even if every host packet is delivered.
-        # Normalize to16-sample producer blocks, compare with the same
-        # fixture's settled no-mirror interval. Four descriptor slots bound
-        # the queue state at each interval boundary: permit four counts per
-        # interval, not an arbitrary percentage or observed-value whitelist.
-        frames=delta['produced']//16;warm_frames=baseline['produced']//16
-        assert frames>0 and warm_frames>0 and delta['underruns']>=0,delta
-        # An ACTIVE descriptor returns before the insufficient-frame branch,
-        # so fewer speculative failures need not mean a transfer was lost.
-        difference=delta['underruns']*warm_frames-baseline['underruns']*frames
-        assert difference<=4*(frames+warm_frames),('FS short-build rate changed',delta,baseline)
+        # usbaudio_kick stops at the first failed builder, so at most one
+        # speculative short build occurs per16-frame producer visit. +1
+        # covers a starting snapshot after produced advances but before that
+        # visit's possible failure. ACTIVE-tail returns before this counter:
+        # relative rates across different queue/servo states are not fixed.
+        assert 0<=delta['underruns']<=delta['produced']//16+1,delta
+        # Consumed counts frames BUILT, not frames delivered. All IN replies
+        # between these stopped worker boundaries are in host_frames; with
+        # no reset/anchor change, their difference is queued inventory. Four
+        # slots of at most45 FS frames bound that difference, not U's rate.
+        assert host_frames>0 and abs(delta['consumed']-host_frames)<=4*45,('FS queued-frame conservation',delta,host_frames)
     return delta
+
+
+def audio_interval(phase,before,after,hs):
+    """Freeze the sample/counter window while the ISO worker is paused."""
+    result=phase.finish()
+    result['output_delta']=check_counter_interval(before,after,hs,result['frames'])
+    result['output_counter_window']=dict(before=dict(before),after=dict(after),
+                                         host_frames=result['frames'],host_packets=result['measured_polls'])
+    return result
 
 
 def stream_service(b,consume):
@@ -421,23 +494,18 @@ def run(image, modules, model, hs, out):
             b.iso_hz(8000//(1<<(bint-1)) if hs else 1000)
             b.ctrl_nodata(0x01,0x0b,1,4)
             if ain and hs:b.ctrl_nodata(0x01,0x0b,1,5)
-            input_frame=0;audio_evidence=[]
+            cycle=IsoCycle(b,nch,in_channels if ain and hs else 0);audio_evidence=[]
             summed=not hs and audio in ('USB AUDIO OUT TRACKS','USB AUDIO OUT TRACKS MAIN CUE')
             expected=[{sum((t+1)*0x100000+lr*0x10000+f*0x100 for t in range(8)) for f in range(16)} for lr in range(2)] if summed else [{tap_word(src,lr,f)&0xffffff00 for f in range(16)} for src,lr in taps]
             # The low-byte guard also exists in tap_word: Q31 unity truncates
             # positive source words by one, below the transmitted24bits.
             rb=TAP_RB if not summed else b''.join(((t+1)*0x100000+lr*0x10000+f*0x100+0x77).to_bytes(4,'big') for _ in range(2) for t in range(8) for f in range(16) for lr in range(2))
-            phase=AudioPhase('warmup',expected,settle=80)
+            phase=AudioPhase('warmup',expected,settle=80,fs=not hs)
             controls_done=False
             def input_counters():return struct.unpack('>15I',b.ctrl_in(0xc0,0x56,0,0,60))
             def poll_one():
-                nonlocal input_frame
                 b.try_pokes(((RB_BASE,rb),(MAIN_CUE_BASE,TAP_MC)))
-                packet=b.ep_in(3,1024);phase.feed(packet)
-                if ain and hs:
-                    n=len(packet)//(4*nch)
-                    payload=b''.join(struct.pack('<I',(((ch<<20)|((input_frame+j)&0xfffff))<<8)) for j in range(n) for ch in range(in_channels))
-                    assert b.ep_out(3,payload)==len(payload);input_frame+=n
+                phase.feed(cycle())
             pump=IsoWorker(poll_one)
             def concurrent():
                 nonlocal midi_during_mirror,controls_done,expected_stalls
@@ -449,23 +517,21 @@ def run(image, modules, model, hs, out):
                 if mirror_phase and not controls_done:
                     expected_stalls+=uac2_during_lease(b,request,0x12340004)
                     controls_done=True
-            pump.run(80)
-            baseline_before=usb_host.counters(b)
+            pump.run(80-cycle.prime(phase.feed))
+            warm_before=usb_host.counters(b)
             pump.run(160)
             before=usb_host.counters(b);before_in=input_counters() if ain and hs else None
-            baseline_after=before
-            warm=phase.finish()
-            warm['output_delta']=check_counter_interval(baseline_before,before,baseline_before,before,hs)
+            warm=audio_interval(phase,warm_before,before,hs)
             audio_evidence.append(warm)
             lease=request(0x58,0x0004,0x1234)
             assert lease.header.status in (wire.Status.PENDING,wire.Status.OK)
-            phase=AudioPhase('active lease',expected)
+            phase=AudioPhase('active lease',expected,fs=not hs)
             mirror_phase=True;pump.resume()
             last_body,active_identity=snapshot(0x12340004,concurrent,release=False)
             pump.pause()
             assert midi_during_mirror and controls_done
-            active=phase.finish();after=usb_host.counters(b)
-            active['output_delta']=check_counter_interval(before,after,baseline_before,baseline_after,hs)
+            after=usb_host.counters(b)
+            active=audio_interval(phase,before,after,hs)
             if before_in is not None:
                 after_in=input_counters();delta=[v-u for u,v in zip(before_in,after_in)]
                 assert delta[0]>0 and delta[1]>0 and delta[2]>0 and delta[8]==0 and delta[14]==0,delta
@@ -478,7 +544,7 @@ def run(image, modules, model, hs, out):
             b.setup(0xc0,0x59,active_identity.token,0,64);b.call(0x40010b00,timeout=10)
             pump.pause()
             active.update(phase.finish())
-            active['output_counter_window']='through snapshot completion, before READY READ fence'
+            active['output_counter_scope']='through snapshot completion, before READY READ fence'
             b.reset()
             assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x00'
             if ain and hs:assert b.ctrl_in(0x81,0x0a,0,5,1)==b'\x00'
@@ -491,12 +557,11 @@ def run(image, modules, model, hs, out):
             b.ctrl_nodata(0x01,0x0b,1,4)
             if ain and hs:b.ctrl_nodata(0x01,0x0b,1,5)
             mirror_phase=False
-            phase=AudioPhase('after reset/restart',expected,settle=80)
-            pump.run(80)
+            phase=AudioPhase('after reset/restart',expected,settle=80,fs=not hs)
+            pump.run(80-cycle.prime(phase.feed))
             restart_before=usb_host.counters(b)
             pump.run(160)
-            restart=phase.finish()
-            restart['output_delta']=check_counter_interval(restart_before,usb_host.counters(b),baseline_before,baseline_after,hs)
+            restart=audio_interval(phase,restart_before,usb_host.counters(b),hs)
             audio_evidence.append(restart)
             if ain and hs:b.ctrl_nodata(0x01,0x0b,0,5)
             b.ctrl_nodata(0x01,0x0b,0,4)

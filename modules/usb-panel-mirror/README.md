@@ -118,8 +118,15 @@ alone would not prove the flush finished. This establishes the firmware
 flush/reply sequence; pre-ISR physical timing remains unmeasured.
 
 With audio streaming, the verifier multiplexes the borrowed getter's reply
-with bounded ISO IN polling and drains both responses. A synchronous getter
-alone would deadlock the port's ISO starvation hold. This host-side fence
+with bounded ISO polling and drains every response. Each continuous worker
+run permits at most 4,096 ISO cycles. Duplex cycles reserve IN3 and OUT3
+replies before one serialized send, then await both under one command
+deadline. OUT uses the preceding IN packet's frame count (initially 11 at
+HS bInterval2), matching the existing input gate's modeled cadence. At startup and restart, at most
+16 IN-only polls from the 80-poll settling allowance wait for two state7
+visits via the input frame counter: SET_INTERFACE acknowledges before that
+deferred work arms OUT. Every submitted OUT must still complete in full.
+A synchronous getter alone would deadlock the port's ISO starvation hold. This host-side fence
 does not change the model or introduce a device debug endpoint.
 
 ## Checks
@@ -144,14 +151,22 @@ interval. After bounded settling, empty packets and unexpected nonzero
 samples fail; more than eight consecutive packets without identifiable
 samples in any one channel fail. Active output counter deltas must advance; HS requires zero
 new underruns/overruns/bank duplicates/reprimes. At FS, the existing counter
-named `underruns` also counts speculative short packet-build attempts:
-reject an increase in its rate per 16-sample producer block against settled
-warmup for the active lease and restart intervals, allowing four descriptor
-slots at each boundary. Fewer speculative failures are allowed: an ACTIVE
-descriptor returns before that counter's increment. Record the raw nonzero
-values; this bounded modeled tolerance is not a physical dropout
-measurement. Applicable input packet/frame counters must advance without
-bad or partial packets. Input destination routing remains the independent
+named `underruns` counts speculative short packet-build attempts. A full
+descriptor queue returns before that increment, so its rate need not match
+across warmup, active and restart. Instead, source control flow bounds it
+to one per 16-sample producer block, plus one frame already in progress at
+the first counter snapshot. Independently, every settled FS packet must
+carry 43..45 frames, and K consecutive packets must carry between
+floor(43.9K) and ceil(44.3K) frames, from the servo's clamped step and
+accumulator. Within an uninterrupted window with unchanged anchor, queued
+frames (`consumed`) and received frames may differ by at most 180: four
+descriptors of at most 45 frames. Other measured fault deltas remain zero.
+Stopped worker boundaries account for every reply; stored counter windows
+exclude settling and the later READY READ fence even when displayed sample
+totals include that fence. Raw before/after counters preserve cumulative
+startup faults separately from settled deltas. These modeled checks are
+not physical dropout measurements. Applicable input packet/frame counters
+must advance without bad or partial packets. Input destination routing remains the independent
 input gate's responsibility.
 
 These samples use a controlled synthetic bench fixture. The stock ColdFire
