@@ -437,7 +437,9 @@ def run(image, modules, model, hs, out):
         expected=tables['cfg_hs' if hs else 'cfg_fs']
         assert cfg==expected[:int.from_bytes(expected[2:4],'little')],'configuration bytes changed'
         assert bytes.fromhex(descriptions['other_speed'])==tables['cfg_os_fs' if hs else 'cfg_os_hs'],'other-speed configuration bytes changed'
-        info=wire.parse_info(request(0x57,length=64))
+        initial_info=request(0x57,length=64)
+        info=wire.parse_info(initial_info)
+        assert initial_info.header.generation>0,'INFO omitted the initialized shadow generation'
         assert info.valid_lcd_blocks==128,'capture did not observe complete initialization'
         assert info.max_response==64
         assert usb_host.msc_test(b),'MSC fallback failed'
@@ -472,10 +474,17 @@ def run(image, modules, model, hs, out):
             assert len(bad)==32 and bad[6]==wire.Status.BAD_REQUEST and bad[16:28]==bytes(12)
         # Normal-runtime producer call changes the real emulated panel. Mirror
         # reads themselves never request a redraw. Scratch is module-owned.
+        before_update=request(0x57,length=64).header.generation
+        assert before_update>=again.generation,'INFO is older than the validated snapshot'
         synthetic=bytes([0x10,0])+bytes([0x81,0x01,0x80,0x55,0xaa,0,0xff,0x18])+b'\x21\xa5\x3a\x12'
         b.poke(sym['pm_test_scratch'],synthetic)
         b.call(0x40010b1c,len(synthetic),sym['pm_test_scratch'])
+        updated_info=request(0x57,length=64).header.generation
+        assert updated_info>=before_update+3,'INFO did not observe the three complete synthetic updates'
         last_body,changed=snapshot(0x12340003)
+        assert changed.generation>=updated_info,'new snapshot predates the INFO change'
+        assert request(0x57,length=64).header.generation>=changed.generation,'INFO regressed after snapshot'
+        print(f'  [PASS] {tag}: INFO current generation advances {before_update}->{updated_info}, validated snapshot {changed.generation}',flush=True)
         assert changed.generation>again.generation and last_body!=first
         if audio:
             b=ConcurrentBench(b)

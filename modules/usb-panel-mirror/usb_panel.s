@@ -111,6 +111,9 @@ pm_ctrl:
         bne.w .Lbad
         cmpi.l #OTPM_BOOTSTRAP_RESPONSE_SIZE,%d7
         bne.w .Lbad
+| Valid INFO describes the current shadow, not a frozen leased body.
+        move.l pm_generation,%d0
+        move.l %d0,12(%a2)
         move.w #OTPM_INFO_SIZE,22(%a2)
         move.b #OTPM_BODY_SCHEMA,32(%a2)
         move.b #OTPM_MODEL_UNKNOWN,33(%a2)

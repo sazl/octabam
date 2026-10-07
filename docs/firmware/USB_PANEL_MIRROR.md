@@ -136,7 +136,7 @@ stalls. These initial port results are supplemented by the final reviewed
 selected-image validation below. There is no physical unit, project audio
 workload, flash, hardware latency/headroom measurement or driver trace.
 
-Final digital validation uses verifier checkpoint `dd7e4cfe`, SHA-256
+The original digital validation used verifier checkpoint `dd7e4cfe`, SHA-256
 `bf0877408affd378132bca5211265f78e5ecf8afae05149a8676057758a79a45`.
 It completed all 20 registry-accepted output/input selections on MKI/MKII at
 HS/FS, all four standalone dimensions, and three private negative controls.
@@ -156,7 +156,8 @@ The private matrix JSON hash is
 `e03f9179c1b8b197595c933194b1d678537b0f3de3e3d6c3d6d31135805e258a`.
 Per-image/runtime fingerprints, raw counter endpoints, dimension audit and
 restoration evidence stay in ignored/local output, not in repository fixtures.
-Final combined-root gate results remain pending separately from this checkpoint.
+See the final PR's reached-gate record for combined-root results and their exact
+commit. This matrix remains evidence for the original checkpoint above.
 
 Feature-off comparison of the reviewed core at fixed BUILD=0, XBUS=1, SPEC=1
 found all 25 successful whole images, all 27 normalized build reports and all

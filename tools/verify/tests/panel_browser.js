@@ -16,8 +16,8 @@ async function evaluate(expression, socket = ws) {
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 function assert(value, message) { if (!value) throw new Error(message); }
-async function fixture(source, state = 'live', hasFrame = true) {
-  await fetch(`${base}/fixture?source=${source}&state=${state}&frame=${hasFrame ? 1 : 0}`);
+async function fixture(source, state = 'live', hasFrame = true, seq = null) {
+  await fetch(`${base}/fixture?source=${source}&state=${state}&frame=${hasFrame ? 1 : 0}${seq == null ? '' : '&seq=' + seq}`);
   await evaluate('poll()');
 }
 const events = `(() => {
@@ -59,6 +59,47 @@ try {
     await fixture('hardware','server_error',true);
     assert((await label()).includes('last verified'), 'transport failure after a frame must label the retained frame');
     console.log('PASS: real Chromium first-status/no-frame failure and verified-frame preservation');
+  } else if (mode === 'publication') {
+    const screens = async () => (await (await fetch(`${base}/requests?full=1`)).json()).filter(p => p.startsWith('/screen.png?'));
+    const pixel = () => evaluate(`(() => {
+      const img = document.querySelector('#screen');
+      if (!img.complete || !img.naturalWidth) return null;
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+      const context = canvas.getContext('2d'); context.drawImage(img, 0, 0);
+      return context.getImageData(0, 0, 1, 1).data[0];
+    })()`);
+    async function shown(red) {
+      const deadline = Date.now() + 3000;
+      while ((await pixel()) !== red) {
+        assert(Date.now() < deadline, `published PNG must actually render red=${red}; requests=${await screens()}; image=${await evaluate("JSON.stringify({ready:document.readyState, src:document.querySelector('#screen').src, width:document.querySelector('#screen').naturalWidth,phase:document.querySelector('#phase').textContent})")}`);
+        await pause(20);
+      }
+    }
+    async function requested(count) {
+      const deadline = Date.now() + 3000;
+      while ((await screens()).length < count) {
+        assert(Date.now() < deadline, `expected ${count} PNG requests; got ${await screens()}`);
+        await pause(20);
+      }
+    }
+    await shown(0);
+    assert((await screens()).length === 1, 'initial hardware publication must request one PNG');
+    await fixture('hardware', 'disconnected');
+    assert((await pixel()) === 0, 'disconnect retains rendered verified PNG');
+    assert((await evaluate("document.querySelector('#note span').textContent")).includes('last verified'), 'retained PNG is labelled stale');
+    await fixture('hardware', 'live', true, 2);
+    await shown(255);
+    assert(JSON.stringify(await screens()) === JSON.stringify(['/screen.png?1', '/screen.png?2']), 'same device generation with new host seq/epoch/connection must fetch new publication');
+    await fixture('hardware'); await fixture('hardware'); await pause(400);
+    assert((await screens()).length === 2, 'unchanged host publication must not refetch PNG');
+    await fixture('legacy', 'live', true, 1); await requested(3); await shown(0);
+    assert((await screens()).length === 3, 'source transition renders emulator publication');
+    await fixture('hardware', 'live', true, 2); await requested(4); await shown(255);
+    assert((await screens()).length === 4, 'returning hardware source renders current publication');
+    await call('Page.navigate', {url:base}); await pause(600); await shown(255);
+    assert((await screens()).length === 5, 'reload renders the current hardware publication');
+    assert((await evaluate("document.querySelector('#source').textContent")).includes('READ ONLY'), 'reconnected/reloaded hardware remains read only');
+    console.log('PASS: Chromium renders distinct PNG pixels across same-generation reconnect, retains stale pixels, suppresses unchanged seq, and preserves source-switch/reload rendering');
   } else if (mode === 'delayed-audio') {
     await fixture('legacy');
     await fetch(`${base}/audio-gate?hold=1`);

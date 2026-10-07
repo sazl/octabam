@@ -632,15 +632,15 @@ initialization, late attach, interrupted publication, lease expiry/reset,
 CRC/chunk faults, DMA/replacement-setup/abort, preserved descriptors/requests and
 existing audio/MIDI/input/alignment gates across standalone and supported audio
 selections. Deliberately bypass capture or dispatch to demonstrate that the
-instrument fails. The reviewed final verifier passed all 80 registry matrix
+instrument fails. The original verifier checkpoint `dd7e4cfe` passed all 80 registry matrix
 runs (20 output/input selections × MKI/MKII × HS/FS), four standalone runs and
 three private capture/dispatch/publisher negative controls. These runs establish
 modeled digital behavior, not a physical integration. The 240 audio windows
 retain raw counters: FS short-build counts 0–444 use source/cadence/conservation
 bounds; 30 HS input selections show underrun deltas 0–2 and only claim input
 progress/bad-partial checks. DSP destination routing is the separate gate below.
-Final combined-root gates remain pending; earlier host-suite totals describe
-their own branch checkpoints.
+See the final PR's reached-gate record for combined-root results and their exact
+commit; earlier host-suite and matrix totals describe their own checkpoints.
 
 Independent existing gates cover 20 output selections through an image-validated
 private park wrapper, 15 native input selections and five input-absent N/A cases

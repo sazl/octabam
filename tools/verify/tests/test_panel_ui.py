@@ -1,6 +1,6 @@
 """Firmware-free browser event checks; optional existing Chromium/Node instrument.
 
-The fake HTTP source serves only synthetic status and an empty image. No device,
+The fake HTTP source serves only synthetic status and generated PNG images. No device,
 firmware, package install, or npm dependency is used. Missing browser tooling is
 reported as a unittest skip; source-text checks are not browser evidence.
 """
@@ -8,6 +8,8 @@ import http.server
 import json
 import os
 import signal
+import struct
+import zlib
 import pathlib
 import shutil
 import subprocess
@@ -30,6 +32,9 @@ class PanelBrowserTests(unittest.TestCase):
     def test_delayed_audio_status_cannot_restore_hardware_controls(self):
         self.run_browser('delayed-audio')
 
+    def test_reconnect_refreshes_same_device_generation_publication(self):
+        self.run_browser('publication')
+
     def run_browser(self, mode):
         if os.name != 'posix':
             self.skipTest('optional Chromium process-group instrument requires a POSIX host')
@@ -42,8 +47,15 @@ class PanelBrowserTests(unittest.TestCase):
         skin_dir = tempfile.TemporaryDirectory(prefix='panel-skin-')
         subprocess.run([shutil.which('python3'), str(ROOT / 'tools/panel/skin/gen_svg.py'), skin_dir.name], check=True, capture_output=True)
         skin_path = pathlib.Path(skin_dir.name)
-        skin = ('window.SKIN=' + (skin_path / 'octatrack-elements.json').read_text() + ';window.SKIN_SVG=' + json.dumps((skin_path / 'octatrack.svg').read_text()) + ';').encode()
-        state = {'source': 'hardware', 'connection_state': 'live', 'has_frame': True}
+        skin = ('window.SKIN=' + (skin_path / 'octatrack-elements.json').read_text() + ';window.SKIN_SVG=' + json.dumps((skin_path / 'octatrack.svg').read_text().replace('id="screen"', 'id="skin-screen"')) + ';').encode()
+        state = {'source': 'hardware', 'connection_state': 'live', 'has_frame': True,
+                 'generation': 127, 'seq': 1, 'protocol': {'major': 1, 'minor': 0, 'epoch': 1, 'connection_id': 1}}
+        def png(red):
+            def chunk(kind, data):
+                return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+            return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+                    + chunk(b'IDAT', zlib.compress(bytes((0, red, 0, 0)))) + chunk(b'IEND', b''))
+        images = {1: png(0), 2: png(255)}
         requests = []
         full_requests = []
         audio_gate = threading.Event()
@@ -59,6 +71,9 @@ class PanelBrowserTests(unittest.TestCase):
                 q = parse_qs(urlsplit(self.path).query)
                 if path == '/fixture':
                     state.update(source=q['source'][0], connection_state=q['state'][0], has_frame=q['frame'][0] == '1')
+                    if 'seq' in q:
+                        state['seq'] = int(q['seq'][0])
+                        state['protocol'].update(epoch=state['seq'], connection_id=state['seq'])
                     body = b'{}'
                 elif path == '/audio-gate':
                     if q.get('hold') == ['1']:
@@ -78,10 +93,12 @@ class PanelBrowserTests(unittest.TestCase):
                     elif path == '/skin.js':
                         body = skin
                     elif path == '/status':
-                        payload = dict(state, backend=state['source'], read_only=state['source'] == 'hardware', capabilities=['screen'] if state['source'] == 'hardware' else ['screen','leds','controls','emulator','samples','card','audio'], generation=1, seq=1, model=None, device={'serial':'fake-only'}, protocol={'major':1,'minor':0}, build='synthetic', last_contact_at=time.time(), last_snapshot_at=time.time(), last_display_change_at=1, phase='ready', booted=True)
+                        payload = dict(state, backend=state['source'], read_only=state['source'] == 'hardware', capabilities=['screen'] if state['source'] == 'hardware' else ['screen','leds','controls','emulator','samples','card','audio'], model=None, device={'serial':'fake-only'}, build='synthetic', last_contact_at=time.time(), last_snapshot_at=time.time(), last_display_change_at=1, phase='ready', booted=True)
                         if state['source'] == 'legacy':
                             payload.pop('source'); payload['backend'] = 'port'
                         body = b'{invalid' if state['connection_state'] == 'server_error' else json.dumps(payload).encode()
+                    elif path == '/screen.png':
+                        body = images[state['seq']]
                     elif path == '/map':
                         body = json.dumps({'keys':{'func':[37,5]},'knobs':{'level':48,'A':49},'leds':{}}).encode()
                     elif path == '/audio/status':
@@ -93,7 +110,8 @@ class PanelBrowserTests(unittest.TestCase):
                     else:
                         body = b'{"ok":true,"result":"synthetic"}'
                 self.send_response(200)
-                self.send_header('Content-Type', 'text/html' if path == '/' else 'text/javascript' if path == '/skin.js' else 'application/json')
+                self.send_header('Content-Type', 'text/html' if path == '/' else 'text/javascript' if path == '/skin.js' else 'image/png' if path == '/screen.png' else 'application/json')
+                self.send_header('Cache-Control', 'no-store')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

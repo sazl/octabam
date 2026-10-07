@@ -251,6 +251,30 @@ class Control(Snapshot):
         self.request(0x58,value=1,length=31)
         self.assertEqual(self.read('pm_lease_state',4),before)
         self.assertTrue(int.from_bytes(self.uc.mem_read(0xfc0b01c0,4),'big')&0x10000)
+    def test_info_tracks_complete_updates_without_changing_frozen_or_error_headers(self):
+        generation = lambda raw: int.from_bytes(raw[12:16], 'big')
+        self.assertEqual(generation(self.request(0x57, length=64)), 0)
+        self.feed(b''.join(bytes([0x10 | page, col]) + bytes(8)
+                           for page in range(8) for col in range(0, 128, 8)))
+        self.assertEqual(generation(self.request(0x57, length=64)), 128)
+        pending = self.request(0x58, value=7)
+        self.assertEqual(pending[6], 1)
+        self.assertEqual(generation(pending), 0)
+        self.call('pm_publish')
+        ready = self.request(0x58, value=7)
+        self.assertEqual(generation(ready), 128)
+        self.feed(b'\x10\x00' + b'\xff' * 7)
+        self.assertEqual(generation(self.request(0x57, length=64)), 128)
+        self.feed(b'\xff')
+        self.assertEqual(generation(self.request(0x57, length=64)), 129)
+        self.assertEqual(generation(self.request(0x58, value=7)), 128)
+        self.assertEqual(generation(self.request(0x59, value=int.from_bytes(ready[16:18], 'big'), length=64)), 128)
+        for req, fields in ((0x57, dict(value=1, length=64)), (0x57, dict(length=65)),
+                            (0x58, dict(value=8)), (0x59, dict(value=0xffff, length=64))):
+            error = self.request(req, **fields)
+            self.assertNotEqual(error[6], 0)
+            self.assertEqual(error[12:28], bytes(16))
+
     def test_lease_duplicate_competing_release_and_expiry(self):
         self.feed(b''.join(bytes([0x10|p,c])+bytes(8) for p in range(8) for c in range(0,128,8)))
         a=self.request(0x58,value=7);self.assertEqual(a[6],1)

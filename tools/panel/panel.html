@@ -1563,7 +1563,8 @@ function renderPhysicalStatus(s) {
   hint(`contact ${time(s.last_contact_at)} · snapshot ${time(s.last_snapshot_at)} · display change ${time(s.last_display_change_at)}`);
   if (frame && can("screen")) {
     hasVerifiedFrame = true;
-    const seq = s.generation == null ? s.seq : s.generation;
+    // Host publications remain distinct across device resets/reconnections.
+    const seq = s.seq;
     if (seq !== lastSeq) { lastSeq = seq; $("#screen").src = "/screen.png?" + seq; }
   }
   if (can("leds") && Object.keys(mapLeds).length && !ledStreamOn) panelFetch("/leds").then(r => r.json()).then(applyLeds).catch(() => {});
