@@ -16,10 +16,11 @@ def mirror_inc(modules):
 MODULE = Module(
     name='usb-panel-mirror', key='USB PANEL MIRROR', kind=Kind.CF_PATCH,
     category=Category.MIDI_USB, author='Sami Zeinelabdin', author_url='https://github.com/sazl',
-    proof=Proof.CHECK, proof_note='Experimental: assembled observer, MKI/MKII capture, MAIN EP0 snapshot under port; controller abort review and physical coexistence remain open.',
+    proof=Proof.CHECK, proof_note='Experimental: MKI/MKII accepted-UART capture and EP0 snapshots verified under the port; pre-ISR abort timing and physical coexistence remain unmeasured.',
     doc='Experimental read-only LCD/LED snapshots from accepted panel bytes over vendor EP0.',
     requires=('USB MIDI',),
     conflicts=(('CF METER IDLE','both own the priority-zero main service loop'),),
+    gates=(Gate('tools/verify/verify_usb_panel.py', remix_arg=True, venv=True, stage='image'),),
     linked=(Linked('panel_boot','modules/usb-panel-mirror/panel_boot.s',cpu='5475'), Linked('panel_capture','modules/usb-panel-mirror/panel_capture.s',cpu='5475',dram=True,include=mirror_inc,defsyms=tuple((s,0) for s in ('pm_boot_dispatch','pm_boot_count','pm_boot_bytes','pm_boot_overflow','pm_boot_invalidate'))), Linked('panel_snapshot','modules/usb-panel-mirror/panel_snapshot.s',cpu='5475',dram=True,include=mirror_inc), Linked('usb_panel','modules/usb-panel-mirror/usb_panel.s',cpu='5475',dram=True,include=mirror_inc)),
     detours=tuple(Detour(addr, bytes.fromhex(op+'fc06400c'), 'panel_boot', symbol,
                         'invalidate mirror on direct runtime panel programming/text')

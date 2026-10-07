@@ -32,6 +32,17 @@ class Composition(unittest.TestCase):
         for output in ('MAIN','MAIN CUE','MASTER','TRACKS','TRACKS MAIN CUE'):
             problems=ledger.check([adapter,self.mods['USB PANEL MIRROR'],self.mods['USB MIDI'],self.mods['USB AUDIO OUT '+output]])
             self.assertTrue(any(self.mods['USB AUDIO OUT '+output].name in p for p in problems),problems)
+    def test_all_descriptor_forms_are_identical_with_feature(self):
+        descriptor=runpy.run_path(str(ROOT/'modules/usb-midi/descriptors.py'))
+        for output in descriptor['HS_LAYOUT']:
+            for inputs in (None,*descriptor['IN_LAYOUT']):
+                keys={'USB MIDI',output}|({inputs} if inputs else set())
+                self.assertEqual(descriptor['remix_inc'](keys),descriptor['remix_inc'](keys|{'USB PANEL MIRROR'}))
+                complete=keys|{'USB PANEL MIRROR'}
+                for key in tuple(complete):complete.update(self.mods[key].requires)
+                self.assertEqual(ledger.check([self.mods[key] for key in complete]),[])
+        self.assertEqual(descriptor['remix_inc']({'USB MIDI'}),descriptor['remix_inc']({'USB MIDI','USB PANEL MIRROR','USB PANEL MIRROR STANDALONE'}))
+
     def test_audio_include_feature_off_is_original(self):
         layout=runpy.run_path(str(ROOT/'modules/usb-audio-out-tracks-main-cue/manifest.py'))['layout_inc']
         for i in range(5):
@@ -39,4 +50,18 @@ class Composition(unittest.TestCase):
             self.assertNotIn('USB_PANEL_MIRROR',off)
             on=layout(i)({'USB MIDI','USB PANEL MIRROR'})
             self.assertIn('.set USB_PANEL_MIRROR, 1',on)
+
+    def test_selected_image_gate_and_matrix_are_reached(self):
+        gates=self.mods['USB PANEL MIRROR'].gates
+        self.assertEqual(len(gates),1)
+        self.assertEqual(gates[0].script,'tools/verify/verify_usb_panel.py')
+        self.assertTrue(gates[0].remix_arg)
+        self.assertEqual(gates[0].stage,'image')
+        verifier=runpy.run_path(str(ROOT/gates[0].script))
+        accepted,rejected=verifier['matrix_selections']()
+        self.assertEqual(rejected,[])
+        self.assertEqual(len(accepted),20)
+        self.assertEqual(len({(row['output'],row['input']) for row in accepted}),20)
+        for row in accepted:
+            self.assertEqual(ledger.check([self.mods[key] for key in row['modules']]),[])
 if __name__=='__main__':unittest.main()

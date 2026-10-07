@@ -25,7 +25,8 @@ register, its CCR result, stack, and subsequent UART scheduling survive.
 There is no allocation, callback into the OS, CRC or copy of a full frame
 inside this masked span. The verifier's synthetic ColdFire execution
 checks the 128-instruction added-work budget; that count is not a physical
-time measurement. The proposed physical masked-span ceiling is 10 us,
+time measurement. The actual ROM-to-DRAM complete-LCD-byte path executes
+56 instructions; the parser alone reaches 42. The proposed physical masked-span ceiling is 10 us,
 unmeasured.
 
 A critical ordering detail: stock entry calls `0x4000f9b4` at
@@ -72,6 +73,10 @@ READY as the last store. A raced attempt remains PENDING for a later
 opportunity; the USB interrupt never waits for the publisher. Frozen body
 storage is separate from the live shadow.
 
+A synthetic maximum 1,858-byte body takes 82,518 executed instructions.
+The longest masked publisher span is 20 instructions, with 29 masked
+instructions in total. These are emulator counts, not hardware timings.
+
 The real loop branches from `mirror_idle_park` to `mirror_idle_resume`.
 The emulated gate explicitly configures those symbols with `--main-park`;
 only the branch is idle-skipped. A borrowed bench call returns to the
@@ -103,12 +108,14 @@ the epoch without discarding valid physical LCD state. The standalone
 adapter owns mutually exclusive stock control/lifecycle detours and the
 same EP0 descriptor-page correction as existing audio (credited there).
 
-The immediate-IN-after-aborting-SETUP behavior of the USB model is under
-separate controller review. The present candidate probe explicitly lets
-the guest process the replacement SETUP before checking its new IN data;
-that proves the firmware flush/reply sequence, not autonomous controller
-cancellation before the ISR. Do not treat this remaining instrument issue
-as hardware DMA signoff.
+The USB model can deliver an old primed reply immediately after a new
+SETUP, before executing any guest instruction. Controller investigation
+found no justified automatic cancellation change: Linux ChipIdea and
+TinyUSB drivers explicitly flush outstanding control transfers. The
+probe therefore forces bounded guest service through a borrowed stock
+getter after each SETUP, then checks the new IN data. SETUP acknowledgment
+alone would not prove the flush finished. This establishes the firmware
+flush/reply sequence; pre-ISR physical timing remains unmeasured.
 
 ## Checks
 
@@ -117,6 +124,8 @@ make bus REMIX=usb-panel-main
 .venv/bin/python tools/verify/verify_usb_panel.py usb-panel-main
 make bus REMIX=usb-panel-standalone
 .venv/bin/python tools/verify/verify_usb_panel.py usb-panel-standalone
+.venv/bin/python tools/verify/verify_usb_panel.py usb-panel-main --matrix --model both --speed both --jobs 4
+.venv/bin/python tools/verify/verify_usb_panel.py usb-panel-main --falsify
 .venv/bin/python -m unittest discover -s tools/verify/tests -p 'test_usb_panel_*.py'
 ```
 
@@ -131,3 +140,12 @@ instruments are explicit skips. Missing image/runtime or selected-image
 handshake failures fail the final-image gate. A port run establishes
 modeled logic only: real cache/bus effects, interrupt latency, host-driver
 ownership, audio quality and sustained physical coexistence remain open.
+
+`--matrix` explicitly builds temporary registry-validated carriers for
+every accepted output/input pair, records each image hash, and restores
+the requested carrier afterward. Four independent emulator processes may
+read each immutable image; builds remain serial. Ordinary gate execution
+never rebuilds or substitutes its selected image. `--falsify` privately
+restores the stock capture, dispatch, or publisher sites and requires all
+three altered images to fail the same gate. No firmware-bearing artifacts
+belong in version control.
