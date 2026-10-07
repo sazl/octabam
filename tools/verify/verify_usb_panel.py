@@ -27,7 +27,138 @@ import emu_card  # noqa: E402
 import usb_host  # noqa: E402
 import usb_mirror_protocol as wire  # noqa: E402
 from panel_link import PanelLink  # noqa: E402
-from verify_usb import LAYOUTS, RB_BASE, MAIN_CUE_BASE, TAP_RB, TAP_MC  # noqa: E402
+from verify_usb import LAYOUTS, RB_BASE, MAIN_CUE_BASE, TAP_RB, TAP_MC, tap_word  # noqa: E402
+
+
+class AudioPhase:
+    """Independent interval accounting; warmup cannot satisfy a later phase.
+
+    The producer has a startup cushion, so zero words can occur. Bound that
+    allowance to eight consecutive empty-of-tags
+    packets; nonzero unrecognized words and empty USB packets fail immediately
+    after a declared settling interval.
+    """
+    def __init__(self,name,expected,settle=0):
+        self.name=name;self.expected=expected;self.settle=settle
+        self.polls=0;self.hits=[0]*len(expected);self.blank=0
+    def feed(self,packet):
+        self.polls+=1
+        assert len(packet)%(4*len(self.expected))==0,(self.name,'partial audio frame')
+        if self.polls<=self.settle:return
+        assert packet,(self.name,'empty audio packet')
+        hits=0
+        for i in range(0,len(packet),4):
+            word=int.from_bytes(packet[i:i+4],'little');channel=i//4%len(self.expected)
+            assert word==0 or word in self.expected[channel],(self.name,'unexpected audio word',channel,hex(word))
+            if word:self.hits[channel]+=1;hits+=1
+        self.blank=0 if hits else self.blank+1
+        assert self.blank<=8,(self.name,'sustained unidentifiable/silent audio')
+    def finish(self):
+        assert min(self.hits)>100,(self.name,'insufficient identifiable audio',self.hits)
+        return dict(phase=self.name,polls=self.polls,hits=list(self.hits))
+
+
+def uart_at_generation(raw_uart,final_generation,frozen_generation):
+    """Replay a proved complete-message boundary with all 128 LCD blocks."""
+    represented=lambda link:sum(link.stats['ops'].get(key,0) for key in ('lcd','led_row','led_level','backlight'))
+    final=PanelLink();final.feed(raw_uart)
+    count=represented(final)
+    assert 0<frozen_generation<=final_generation,'snapshot generation is outside captured history'
+    target=count-(final_generation-frozen_generation)
+    assert 0<target<=count,'snapshot boundary is absent from UART capture'
+    class CoveredPanel(PanelLink):
+        def __init__(self):super().__init__();self.coverage=set()
+        def _message(self,message):
+            if 0x10<=message[0]<=0x17:self.coverage.add((message[0]&7,message[1]))
+            super()._message(message)
+    at=CoveredPanel();reached=False
+    for value in raw_uart:
+        at.feed(bytes([value]))
+        if represented(at)==target:reached=True;break
+    assert reached and represented(at)==target,'UART target message boundary was not reached'
+    assert len(at.coverage)==128,'UART target lacks complete LCD initialization'
+    return at
+
+
+def check_audio_fixture(selectors,state):
+    assert selectors==bytes([7])*16,'synthetic source selectors changed'
+    for track in range(8):
+        values=struct.unpack('>4I',state[68*track:68*track+16])
+        assert values==(0,0x7fffffff,0,0),('CF delay did not reach bypass',track,values)
+
+
+def check_counter_interval(before,after,baseline_before,baseline_after,hs):
+    keys=('produced','consumed','underruns','overruns','bankdup','reprimes')
+    delta={key:after[key]-before[key] for key in keys}
+    baseline={key:baseline_after[key]-baseline_before[key] for key in keys}
+    assert delta['produced']>0 and delta['consumed']>0,delta
+    assert all(delta[key]==0 for key in ('overruns','bankdup','reprimes')),delta
+    if hs:assert delta['underruns']==0,delta
+    else:
+        # audio_pkt_build increments this counter on a speculative short
+        # build (source line633), even if every host packet is delivered.
+        # Normalize to16-sample producer blocks, compare with the same
+        # fixture's settled no-mirror interval. Four descriptor slots bound
+        # the queue state at each interval boundary: permit four counts per
+        # interval, not an arbitrary percentage or observed-value whitelist.
+        frames=delta['produced']//16;warm_frames=baseline['produced']//16
+        assert frames>0 and warm_frames>0 and delta['underruns']>=0,delta
+        difference=abs(delta['underruns']*warm_frames-baseline['underruns']*frames)
+        assert difference<=4*(frames+warm_frames),('FS short-build rate changed',delta,baseline)
+    return delta
+
+
+def stream_service(b,consume):
+    """Fence guest service while continuing ISO polls on the same bench.
+
+    A synchronous borrowed call alone deadlocks the model's ISO starvation
+    hold. Multiplex its response with actual IN polls; consume every response
+    and leave no pending transfer before returning.
+    """
+    b.sock.sendall(b'call 0x40010b00\nin 3 1024\n')
+    done=False;pending=True;polls=0;deadline=time.monotonic()+10
+    while not done or pending:
+        assert time.monotonic()<deadline,'streaming guest-service fence timed out'
+        line=b.wait('',timeout=max(.01,deadline-time.monotonic()))
+        if line.startswith('call '):
+            assert not line.startswith('call err'),line
+            done=True
+        elif line.startswith('in 3'):
+            fields=line.split();assert len(fields)<3 or fields[2]!='stall',line
+            consume(bytes.fromhex(fields[2]) if len(fields)>2 else b'')
+            polls+=1;pending=False
+            assert polls<=512,'streaming guest-service fence exceeded poll budget'
+            if not done:b.sock.sendall(b'in 3 1024\n');pending=True
+        else:raise AssertionError(('unexpected fence response',line))
+
+
+def uac2_during_lease(b,request,cookie,service=None):
+    """Preserve one live lease across class requests and deferred OUT abort."""
+    lease=request(0x58,cookie&65535,cookie>>16)
+    assert lease.header.status in (wire.Status.PENDING,wire.Status.OK)
+    token=lease.header.token
+    assert b.ctrl_in(0xa1,1,0x100,0x1003,4)==struct.pack('<I',44100)
+    assert b.ctrl_in(0xa1,2,0x100,0x1003,14)==b'\x01\x00'+struct.pack('<III',44100,44100,0)
+    assert b.ctrl_in(0xa1,1,0x200,0x1003,1)==b'\x01'
+    for rate in (44100,48000):
+        b.setup(0x21,1,0x100,0x1003,4)
+        assert b.ep_out(0,struct.pack('<I',rate))==4
+        try:b.ep_in(0,64)
+        except usb_host.Stall:assert rate==48000
+        else:assert rate==44100,'unsupported rate did not STALL'
+    # No OUT data arrives. This bounded guest-service barrier makes the
+    # existing 100,000-poll clock wait retire into its deferred state before
+    # the replacement SETUP; it is not a physical packet-timing claim.
+    b.setup(0x21,1,0x100,0x1003,4)
+    (service or (lambda:b.call(0x40010b00,timeout=10)))()
+    request(0x57,length=64)
+    b.setup(0x21,1,0x100,0x1003,4)
+    assert b.ep_out(0,struct.pack('<I',44100))==4
+    assert b.ep_in(0,64)==b''
+    assert b.ctrl_in(0xa1,1,0x100,0x1003,4)==struct.pack('<I',44100)
+    same=request(0x58,cookie&65535,cookie>>16)
+    assert same.header.status in (wire.Status.PENDING,wire.Status.OK) and same.header.token==token
+    return 1
 
 
 def symbols():
@@ -53,6 +184,7 @@ def run(image, modules, model, hs, out):
     dump=out/(tag+'-shadow');dump.mkdir(exist_ok=True)
     fields={'pm_generation':4,'pm_lcd':1024,'pm_row_seen':32,'pm_row_values':32,'pm_level_seen':256,'pm_level_values':256,'pm_backlight':1,'pm_backlight_known':4}
     memory=';'.join(f'{sym[name]:#x},{size}={dump}/{name}.bin' for name,size in fields.items())
+    if audio:memory+=f';0x80000eb4,16={dump}/fixture_selectors.bin;0x80005f60,544={dump}/fixture_delay.bin'
     shared=ROOT/'out/verify_usb_panel';shared.mkdir(exist_ok=True)
     tree=shared/'cardtree';(tree/'OCTABAM/AUDIO').mkdir(parents=True,exist_ok=True)
     card=shared/'card.img'
@@ -71,7 +203,7 @@ def run(image, modules, model, hs, out):
         raw=b.ctrl_in(0xc0,op,value,index,length)
         try:return wire.parse_response(raw,request=wire.SetupRequest(0xc0,op,value,index,length))
         except wire.ProtocolError as exc:raise wire.ProtocolError(f'{exc}: request {op:#x} received {raw.hex()}') from exc
-    def snapshot(cookie, interleave=None):
+    def snapshot(cookie, interleave=None, release=True):
         response=request(0x58,cookie & 65535,cookie>>16)
         for _ in range(2000):
             if response.header.status==wire.Status.OK:break
@@ -92,9 +224,10 @@ def run(image, modules, model, hs, out):
         # Duplicate reads are byte-identical; the client may retry after timeout.
         a=request(0x59,identity.token,0,64);c=request(0x59,identity.token,0,64)
         assert a==c
-        assert request(0x5a,identity.token).header.status==wire.Status.OK
-        assert request(0x5a,identity.token).header.status==wire.Status.OK
-        assert request(0x59,identity.token,0,64).header.status==wire.Status.STALE
+        if release:
+            assert request(0x5a,identity.token).header.status==wire.Status.OK
+            assert request(0x5a,identity.token).header.status==wire.Status.OK
+            assert request(0x59,identity.token,0,64).header.status==wire.Status.STALE
         return bytes(body),identity
     try:
         b=usb_host.Bench(sock,timeout=30)
@@ -147,6 +280,13 @@ def run(image, modules, model, hs, out):
         assert changed.generation>again.generation and last_body!=first
         if audio:
             nch,_,bint,taps=LAYOUTS[audio]
+            # Controlled synthetic source fixture, not an operator project.
+            # Stock 40003510/1c tests this two-bank selector against7; that
+            # path sets CF delay wet/send/feedback0, dry7fffffff. Merely
+            # editing the four-bank parameter cache is ineffective: stock
+            # 4000d13c/146 refreshes it each frame. Assert the retained
+            # selectors and independently derived cached coefficients below.
+            b.poke(0x80000eb4,bytes([7])*16)
             midi=bytes.fromhex('904163')
             b.poke(sym['pm_test_scratch'],midi);b.call(0x40010bc8,len(midi),sym['pm_test_scratch'])
             mirror_phase=False;midi_during_mirror=False
@@ -154,51 +294,78 @@ def run(image, modules, model, hs, out):
             b.iso_hz(8000//(1<<(bint-1)) if hs else 1000)
             b.ctrl_nodata(0x01,0x0b,1,4)
             if ain and hs:b.ctrl_nodata(0x01,0x0b,1,5)
-            seen=[0]*nch;wrong=[];audio_polls=0;input_frame=0
+            input_frame=0;audio_evidence=[]
             summed=not hs and audio in ('USB AUDIO OUT TRACKS','USB AUDIO OUT TRACKS MAIN CUE')
-            sum_words=[{sum((t+1)*0x100000+lr*0x10000+f*0x100 for t in range(8)) for f in range(16)} for lr in range(2)]
-            rb=TAP_RB if not summed else b''.join(((t+1)*0x100000+lr*0x10000+f*0x100).to_bytes(4,'big') for _ in range(2) for t in range(8) for f in range(16) for lr in range(2))
+            expected=[{sum((t+1)*0x100000+lr*0x10000+f*0x100 for t in range(8)) for f in range(16)} for lr in range(2)] if summed else [{tap_word(src,lr,f)&0xffffff00 for f in range(16)} for src,lr in taps]
+            # The low-byte guard also exists in tap_word: Q31 unity truncates
+            # positive source words by one, below the transmitted24bits.
+            rb=TAP_RB if not summed else b''.join(((t+1)*0x100000+lr*0x10000+f*0x100+0x77).to_bytes(4,'big') for _ in range(2) for t in range(8) for f in range(16) for lr in range(2))
+            phase=AudioPhase('warmup',expected,settle=80)
+            controls_done=False
+            def input_counters():return struct.unpack('>15I',b.ctrl_in(0xc0,0x56,0,0,60))
             def concurrent():
-                nonlocal audio_polls,input_frame,midi_during_mirror
+                nonlocal input_frame,midi_during_mirror,controls_done,expected_stalls
                 if mirror_phase and not midi_during_mirror:
                     usb_host.midi_send(b,bytes.fromhex('904163f8'))
                     assert b'\x09'+midi in b.ep_in(2,512)
                     midi_during_mirror=True
+                if mirror_phase and not controls_done:
+                    expected_stalls+=uac2_during_lease(b,request,0x12340004,lambda:stream_service(b,phase.feed))
+                    controls_done=True
                 for _ in range(8):
                     b.poke(RB_BASE,rb);b.poke(MAIN_CUE_BASE,TAP_MC)
-                    packet=b.ep_in(3,1024);audio_polls+=1
-                    assert len(packet)%(4*nch)==0
-                    for i in range(0,len(packet),4):
-                        w=int.from_bytes(packet[i:i+4],'little');src=(w>>24)-0x10;lr=((w>>16)&255)-0x20
-                        if summed:
-                            channel=(i//4)%2
-                            if w in sum_words[channel]:seen[channel]+=1
-                            elif w in sum_words[1-channel]:wrong.append((channel,w))
-                        elif 0<=src<10 and lr in (0,1):
-                            channel=(i//4)%nch
-                            if (src,lr)==taps[channel]:seen[channel]+=1
-                            else:wrong.append((channel,src,lr))
+                    packet=b.ep_in(3,1024);phase.feed(packet)
                     if ain and hs:
                         n=len(packet)//(4*nch)
                         payload=b''.join(struct.pack('<I',(((ch<<20)|((input_frame+j)&0xfffff))<<8)) for j in range(n) for ch in range(in_channels))
                         assert b.ep_out(3,payload)==len(payload);input_frame+=n
-            for _ in range(30):concurrent()
+            for _ in range(10):concurrent()
+            baseline_before=usb_host.counters(b)
+            for _ in range(20):concurrent()
+            before=usb_host.counters(b);before_in=input_counters() if ain and hs else None
+            baseline_after=before
+            warm=phase.finish()
+            warm['output_delta']=check_counter_interval(baseline_before,before,baseline_before,before,hs)
+            audio_evidence.append(warm)
+            phase=AudioPhase('active lease',expected)
             mirror_phase=True
-            last_body,_=snapshot(0x12340004,concurrent)
-            assert midi_during_mirror,'MIDI was not exercised with an active mirror lease/audio stream'
-            assert not wrong and min(seen)>100,(seen,wrong[:8])
-            assert b.ctrl_in(0xa1,1,0x100,0x1003,4)==struct.pack('<I',44100)
-            assert len(b.ctrl_in(0xa1,2,0x100,0x1003,14))==14
-            assert b.ctrl_in(0xa1,1,0x200,0x1003,1)==b'\x01'
-            assert len(b.ctrl_in(0xc0,0x55,0,0,60))==60
-            if ain and hs:
-                counters=struct.unpack('>15I',b.ctrl_in(0xc0,0x56,0,0,60))
-                assert counters[0]>0 and counters[2]>0 and counters[8]==0 and counters[14]==0,counters
-                b.ctrl_nodata(0x01,0x0b,0,5)
+            last_body,active_identity=snapshot(0x12340004,concurrent,release=False)
+            assert midi_during_mirror and controls_done
+            active=phase.finish();after=usb_host.counters(b)
+            active['output_delta']=check_counter_interval(before,after,baseline_before,baseline_after,hs)
+            if before_in is not None:
+                after_in=input_counters();delta=[v-u for u,v in zip(before_in,after_in)]
+                assert delta[0]>0 and delta[1]>0 and delta[2]>0 and delta[8]==0 and delta[14]==0,delta
+                active['input_delta']=delta
+            audio_evidence.append(active)
+            # The body is READY and streams are still alt1. Prime a real READ,
+            # allow guest software to issue it, then reset before data/status.
+            assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x01'
+            b.setup(0xc0,0x59,active_identity.token,0,64);stream_service(b,phase.feed)
+            b.reset()
+            assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x00'
+            if ain and hs:assert b.ctrl_in(0x81,0x0a,0,5,1)==b'\x00'
+            stopped=[b.ep_in(3,1024) for _ in range(8)]
+            assert all(not packet for packet in stopped[2:]),'reset left audio stream running'
+            usb_host.enumerate_device(b,hs=hs)
+            info=wire.parse_info(request(0x57,length=64))
+            assert request(0x57,length=64).header.epoch!=active_identity.epoch
+            assert request(0x59,active_identity.token,0,64).header.status==wire.Status.STALE
+            b.ctrl_nodata(0x01,0x0b,1,4)
+            if ain and hs:b.ctrl_nodata(0x01,0x0b,1,5)
+            mirror_phase=False
+            phase=AudioPhase('after reset/restart',expected,settle=80)
+            for _ in range(10):concurrent()
+            restart_before=usb_host.counters(b)
+            for _ in range(20):concurrent()
+            restart=phase.finish()
+            restart['output_delta']=check_counter_interval(restart_before,usb_host.counters(b),baseline_before,baseline_after,hs)
+            audio_evidence.append(restart)
+            if ain and hs:b.ctrl_nodata(0x01,0x0b,0,5)
             b.ctrl_nodata(0x01,0x0b,0,4)
             for _ in range(8):b.ep_in(3,1024)
             assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x00'
-            print(f'  [PASS] {tag}: concurrent snapshot/{audio_polls} identifiable audio polls; input={ain if hs else None}',flush=True)
+            print(f'  [PASS] {tag}: separate warm/active/restart audio intervals {audio_evidence}; input={ain if hs else None}',flush=True)
         # MIDI runs on its ordinary endpoints alongside the frozen protocol.
         usb_host.midi_send(b,bytes.fromhex('903c64b03c40'))
         midi=bytes.fromhex('903c64');b.poke(sym['pm_test_scratch'],midi)
@@ -221,21 +388,16 @@ def run(image, modules, model, hs, out):
     raw_uart=uart.read_bytes()
     oracle=PanelLink();oracle.feed(raw_uart)
     shadow=lambda name:(dump/(name+'.bin')).read_bytes()
+    if audio:check_audio_fixture(shadow('fixture_selectors'),shadow('fixture_delay'))
     assert shadow('pm_lcd')==bytes(oracle.frame),'live shadow LCD disagrees with independent UART'
     for family,reference in (('row',oracle.led_rows),('level',oracle.leds)):
         seen=shadow('pm_'+family+'_seen');values=shadow('pm_'+family+'_values')
         assert {i:v for i,v in enumerate(values) if seen[i]}==reference,'live shadow '+family+' disagrees with UART'
-    represented=lambda link:sum(link.stats['ops'].get(key,0) for key in ('lcd','led_row','led_level','backlight'))
     # Boot-ring bytes before RTOS attachment precede this UART instrument.
     # Anchor the generation offset with the final separately-checked shadow,
     # then compare the frozen body at its own exact complete-message boundary.
     final_generation=int.from_bytes(shadow('pm_generation'),'big')
-    target=represented(oracle)-(final_generation-last_identity.generation)
-    assert target>=128,'snapshot predates complete UART initialization'
-    at_snapshot=PanelLink()
-    for value in raw_uart:
-        at_snapshot.feed(bytes([value]))
-        if represented(at_snapshot)==target:break
+    at_snapshot=uart_at_generation(raw_uart,final_generation,last_identity.generation)
     frozen=PanelLink();frozen.feed(last_body)
     assert frozen.frame==at_snapshot.frame,'snapshot LCD disagrees with UART at its generation'
     assert frozen.led_rows==at_snapshot.led_rows,'snapshot LED rows disagree with UART'
@@ -245,7 +407,7 @@ def run(image, modules, model, hs, out):
     assert matches and int(matches[-1])==expected_stalls,(matches,expected_stalls)
     assert 'hold ended on the client' in txt,'bench expired instead of completing'
     print(f'  [PASS] {tag}: protocol1.0, complete UART-equal LCD/LED snapshot; expected STALLs={expected_stalls}',flush=True)
-    return dict(model=model,speed='hs' if hs else 'fs',uart_bytes=len(uart.read_bytes()),body_bytes=len(last_body),descriptors=descriptions,expected_stalls=expected_stalls)
+    return dict(model=model,speed='hs' if hs else 'fs',uart_bytes=len(uart.read_bytes()),body_bytes=len(last_body),descriptors=descriptions,expected_stalls=expected_stalls,audio=audio_evidence if audio else [])
 
 
 def matrix_selections():
@@ -277,7 +439,8 @@ def matrix(args):
     name=f'_usb_panel_matrix_{os.getpid()}'
     path=ROOT/'remixes'/(name+'.py')
     assert not path.exists()
-    env=dict(os.environ,REMIX=name,BUILD='0',XBUS='1',SPEC='1')
+    restore_env=dict(os.environ,REMIX=args.remix or 'usb-panel-main')
+    env=dict(restore_env,REMIX=name,BUILD='0',XBUS='1',SPEC='1')
     rows=[];report=dict(accepted=len(accepted),rejected=rejected,rows=rows)
     models=('mki','mkii') if args.model=='both' else (args.model,)
     speeds=(True,False) if args.speed=='both' else (args.speed=='hs',)
@@ -308,9 +471,8 @@ def matrix(args):
             (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     finally:
         path.unlink(missing_ok=True)
-        restore=args.remix or 'usb-panel-main'
         with (out/'restore.log').open('w') as log:
-            subprocess.run([sys.executable,'tools/build/build_bus.py'],cwd=ROOT,env=dict(env,REMIX=restore),stdout=log,stderr=subprocess.STDOUT,check=True,timeout=180)
+            subprocess.run([sys.executable,'tools/build/build_bus.py'],cwd=ROOT,env=restore_env,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=180)
     print(f'  [PASS] matrix: {len(rows)} accepted carriers verified; {len(rejected)} named rejections',flush=True)
     return 0
 
