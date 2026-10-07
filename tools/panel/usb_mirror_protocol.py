@@ -109,7 +109,8 @@ def validate_definition(definition) -> None:
         if not fmt.startswith('>'):
             raise ProtocolError('wire layout must be big-endian')
         tokens=re.findall(r'[0-9]*[sBHI]',fmt[1:])
-        if ''.join(tokens)!=fmt[1:] or len(tokens)!=len(names):
+        if (''.join(tokens)!=fmt[1:] or len(tokens)!=len(names) or
+                any(token not in ('B','H','I') and not token.endswith('s') for token in tokens)):
             raise ProtocolError('wire layout field count/type mismatch')
         offset=0; offsets={}; widths={}
         for name,token in zip(names,tokens):

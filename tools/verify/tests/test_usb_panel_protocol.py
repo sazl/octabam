@@ -57,6 +57,14 @@ class ProtocolTests(unittest.TestCase):
             fields[first],fields[second]=fields[second],fields[first]
             with self.subTest(section=section,first=first),self.assertRaises(p.ProtocolError):
                 p.validate_definition(definition)
+        for section in ('header','info'):
+            definition=copy.deepcopy(p.DEFINITION)
+            first=next(iter(definition[section+'_widths']))
+            definition[section+'_widths'][first]+=1
+            with self.assertRaises(p.ProtocolError): p.validate_definition(definition)
+        definition=copy.deepcopy(p.DEFINITION)
+        definition['header_struct']=definition['header_struct'].replace('H','2B',1)
+        with self.assertRaises(p.ProtocolError): p.validate_definition(definition)
         p.validate_definition(p.DEFINITION)
 
     def test_crc_vectors(self):
