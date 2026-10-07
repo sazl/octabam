@@ -150,6 +150,15 @@ class DependencyTests(unittest.TestCase):
                      "tools/verify/verify_usb_panel.py"):
             self.assertIn("make check REMIX=usb", commands([path], c=c), path)
 
+    def test_shared_module_source_reaches_other_verifier_callers(self):
+        c = ctx()
+        source = "modules/usb-audio-out-tracks-main-cue/usbaudio.s"
+        c.module_key["usb-audio-out-tracks-main-cue"] = "USB AUDIO OUT TRACKS MAIN CUE"
+        c.remixes_of["USB AUDIO OUT TRACKS MAIN CUE"] = ["usb"]
+        c.remix_scripts.add("tools/verify/verify_usb.py")
+        c.deps["tools/verify/verify_usb.py"] = {source}
+        self.assertIn("make check-remix REMIX=miniverb", commands([source], c=c))
+
     def test_the_build_and_what_it_imports_reach_refhash_identity_and_the_shared_half(self):
         for p in ("tools/build/build_bus.py", "tools/remix/schema.py", "tools/build/dsp_modmap.py", "dsp/probe.asm"):
             self.assertEqual(commands([p]), BUILD, p)

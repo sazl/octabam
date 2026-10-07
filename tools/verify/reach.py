@@ -677,9 +677,11 @@ def classify(paths, ctx):
             else:
                 note = "unknown module directory"
                 gates = ctx.every()
-            if any(u.startswith("tools/verify/tests/") for u in ctx.dependents(path)):
-                gates.append(CMD["test-acceptance"])
-                note += "; firmware-free tests depend on it"
+            if not parts[-1].endswith(".md") and not note.endswith("display fields only"):
+                dependent_gates, dependent_note = route_tool(path, ctx)
+                if dependent_gates:
+                    gates += dependent_gates
+                    note += "; " + dependent_note
         elif top == "remixes" and len(parts) >= 2:
             # remixes/<name>/..., remixes/test/<name>/..., or a flat remixes/<name>.py
             name = parts[2] if parts[1] == "test" and len(parts) >= 3 else parts[1]
