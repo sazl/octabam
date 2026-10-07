@@ -71,6 +71,31 @@ class ProtocolTests(unittest.TestCase):
         for data, crc in ((b'',0),(b'123456789',0xcbf43926),(bytes(range(256)),0x29058c73)):
             self.assertEqual(p.crc32(data),crc)
 
+    def test_zero_crc_is_a_valid_ready_snapshot(self):
+        # Solve the 32 independent CRC contributions of the final four pixel
+        # bytes; these bytes are unconstrained LCD data, not protocol metadata.
+        base=body()[:-4]+bytes(4); baseline=p.crc32(base); basis={}
+        for bit in range(32):
+            value=p.crc32(base[:-4]+(1<<bit).to_bytes(4,'little'))^baseline
+            mask=1<<bit
+            while value:
+                pivot=value.bit_length()-1
+                if pivot in basis:
+                    value^=basis[pivot][0]; mask^=basis[pivot][1]
+                else:
+                    basis[pivot]=(value,mask); break
+        target=baseline; patch=0
+        while target:
+            value,mask=basis[target.bit_length()-1]
+            target^=value; patch^=mask
+        data=base[:-4]+patch.to_bytes(4,'little')
+        self.assertEqual(p.crc32(data),0)
+        ident=identity(data)
+        self.assertEqual(ident.crc32,0)
+        self.assertEqual(p.validate_snapshot(data,identity=ident,info=info()).lcd_blocks,128)
+        with self.assertRaises(p.ProtocolError):
+            p.SnapshotAssembler(dataclasses.replace(ident,total_length=1860),info())
+
     def test_setup_bounds(self):
         for length in (0,31,257,-1,65536):
             with self.assertRaises(p.ProtocolError): p.begin_request(1,length)

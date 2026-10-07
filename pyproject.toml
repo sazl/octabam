@@ -4,8 +4,8 @@
 # dependencies. The local ColdFire emulator (tools/emu/README.md) needs `unicorn`,
 # and the remixer frontend (`make remix`) needs `textual`; both live in
 # `.venv` as the `emu` extra (one extra on purpose — one setup command, and
-# the remixer is the only consumer of either). The tooling prefers that
-# venv and falls back to bare `python3`, where the build and every check
+# interactive views and hardware probes consume these extras). The tooling
+# prefers that venv and falls back to bare `python3`, where the build and every check
 # still run; only the interactive views report themselves unavailable.
 #
 #   uv sync --extra emu     # or: make emu-setup
@@ -21,6 +21,8 @@ dependencies = []
 emu = [
     "unicorn>=2.1",
     "textual>=0.80",
+    # exclusive claim-free physical panel mirror (tools/panel, tools/hw)
+    "pyusb>=1.3.1",
     # the panel's audio output device (tools/panel, CoreAudio through PortAudio)
     "sounddevice>=0.5.6",
     # the harness's measurement tools (abkit, station_laws, click_scan,
