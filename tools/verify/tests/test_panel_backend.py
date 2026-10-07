@@ -185,6 +185,19 @@ assert led_payload(LedSnapshot(b'', ())) == {'bits': '', 'ids': {}}
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_clean_package_import_without_panel_directory_on_path(self):
+        code = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+from tools.panel.panel_backend import LedSnapshot, ViewSnapshot, PanelBackend, render_link, led_payload
+from tools.panel.panel_link import PanelLink
+assert render_link(PanelLink())[0].startswith(b'\\x89PNG')
+assert led_payload(LedSnapshot(b'', ())) == {'bits': '', 'ids': {}}
+'''
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(ROOT)],
+                                cwd="/tmp", capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

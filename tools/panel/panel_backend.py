@@ -10,7 +10,10 @@ import struct
 from typing import Protocol
 import zlib
 
-from panel_link import PanelLink
+if __package__:
+    from .panel_link import PanelLink
+else:
+    from panel_link import PanelLink
 
 
 @dataclass(frozen=True)
