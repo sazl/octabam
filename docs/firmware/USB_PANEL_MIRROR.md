@@ -149,7 +149,7 @@ byte-for-byte and temporary carriers/processes removed.
 | standalone | 4/4 runs, no audio interfaces; exact three deliberate STALLs per run |
 | falsification | 3/3 privately altered capture/dispatch/publisher images rejected by the same verifier |
 | output counters | HS measured fault deltas zero; FS short-build counts 0–444 satisfy the reviewed bounds, other measured deltas zero |
-| concurrent input diagnostics | 30 HS runs advance input counters and reject bad/partial packets; input underrun deltas 0–2, no all-zero-input claim |
+| concurrent input diagnostics | 30 HS runs advance input counters and require zero bad/partial packet deltas; input underrun deltas 0–2, no all-zero-input claim |
 | project alignment | genuine SKIP without an authorized source project; strict release acceptance blocked |
 
 The private matrix JSON hash is
