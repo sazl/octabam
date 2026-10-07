@@ -26,7 +26,8 @@ def layout_inc(layout):
     def inc(modules):
         usb_in = int(any(k in modules for k in ("USB AUDIO IN AB", "USB AUDIO IN CD", "USB AUDIO IN ABCD")))
         return (f"| remix.inc -- usbaudio.s's layout\n    .set USB_LAYOUT, {layout}\n"
-                f"    .set USB_IN, {usb_in}\n")
+                f"    .set USB_IN, {usb_in}\n"
+                + ("    .set USB_PANEL_MIRROR, 1\n" if "USB PANEL MIRROR" in modules else ""))
     return inc
 
 
