@@ -70,6 +70,7 @@ import datetime
 import filecmp
 import io
 import json
+import math
 import os
 import pathlib
 import platform
@@ -95,6 +96,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools")); import toolpath  # noqa: E402,F401
 
 import emu_card as ec  # noqa: E402
+from panel_backend import PanelBackend, ViewSnapshot, LedSnapshot, led_payload  # noqa: E402
 
 SAMPLE_HZ = 44100.0
 FRAME_PERIOD = 16.0                # samples per DSP-frame interrupt
@@ -335,6 +337,7 @@ class PortProc:
         self.lock = threading.Lock()
         self.ready = None               # (sample, frames) from the ready line
         self.commands = 0
+        self.cancel = None            # Panel close can interrupt a pending command wait
         self.started = time.perf_counter()
         err = open(log_path, "ab") if log_path else subprocess.DEVNULL
         self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -363,14 +366,19 @@ class PortProc:
     def alive(self):
         return self.proc.poll() is None
 
-    def wait_ready(self, timeout):
+    def wait_ready(self, timeout, *, cancel=None):
         """Consume the boot report until the ready line; PortDied on exit or silence."""
         deadline = time.perf_counter() + timeout
         rt_refused = None       # the child's own `dsp-rt : cannot start ...` line (O17), if it printed one
         while True:
+            if cancel is not None and cancel.is_set():
+                raise PortDied("server closing")
             try:
-                line = self.lines.get(timeout=max(0.0, deadline - time.perf_counter()))
+                remaining = max(0.0, deadline - time.perf_counter())
+                line = self.lines.get(timeout=min(remaining, 0.1) if cancel is not None else remaining)
             except queue.Empty:
+                if time.perf_counter() < deadline:
+                    continue
                 self.kill()
                 raise PortDied(f"no ready line within {timeout:.0f} s; last: {self.tail()}")
             if line is None:
@@ -385,11 +393,14 @@ class PortProc:
                 return self.ready
             self.log.append(line)
 
-    def command(self, line, expect, timeout=None):
+    def command(self, line, expect, timeout=None, *, closing=False):
         """Send one line, return the reply that starts with `expect`.
         `err ...` raises PortError; a dead or silent child raises PortDied."""
         timeout = self.BACKSTOP if timeout is None else timeout
         with self.lock:
+            cancel = None if closing else self.cancel
+            if cancel is not None and cancel.is_set():
+                raise PortDied("server closing")
             try:
                 self.proc.stdin.write(line.encode("ascii") + b"\n")
                 self.proc.stdin.flush()
@@ -398,9 +409,14 @@ class PortProc:
             self.commands += 1
             deadline = time.perf_counter() + timeout
             while True:
+                if cancel is not None and cancel.is_set():
+                    raise PortDied("server closing")
                 try:
-                    reply = self.lines.get(timeout=max(0.0, deadline - time.perf_counter()))
+                    remaining = max(0.0, deadline - time.perf_counter())
+                    reply = self.lines.get(timeout=min(remaining, 0.1) if cancel is not None else remaining)
                 except queue.Empty:
+                    if time.perf_counter() < deadline:
+                        continue
                     self.kill()
                     raise PortDied(f"no reply to {line!r} within {timeout:.0f} s")
                 if reply is None:
@@ -415,7 +431,7 @@ class PortProc:
     def quit(self):
         try:
             if self.alive():
-                self.command("quit", "ok", timeout=2.0)
+                self.command("quit", "ok", timeout=2.0, closing=True)
         except (PortDied, PortError):
             pass
         self.kill()
@@ -1679,6 +1695,8 @@ class Panel:
                  card_file=None, backend_note="", pool=None, card_builder=None,
                  staged_audio=None, sound=False, takes_dir=None, card_persistent=False,
                  card_rw=False, card_meta=None):
+        self.stop_event = threading.Event()
+        self.snapshot_at = self.display_changed_at = 0.0
         self.image = image
         # The persistent card (O19, 13 Sep 2026): card_file is the user's
         # own image, booted as it is with --card-rw (card_rw: the binary
@@ -1793,7 +1811,8 @@ class Panel:
         self.handlers = self._read_table(image)
         self.param_map = load_param_map()       # what the page encoders edit (param_map.json)
         self._new_link()
-        threading.Thread(target=self._loop, daemon=True, name="emu").start()
+        self.worker = threading.Thread(target=self._loop, daemon=True, name="emu")
+        self.worker.start()
 
     def _new_link(self):
         """A fresh decoder and stream positions: at start and after a port respawn."""
@@ -1875,6 +1894,8 @@ class Panel:
                 self.frame = png
                 self.screen_txt = "\n".join("".join("#" if px else "." for px in row) for row in lcd) + "\n"
                 self.seq += 1
+                self.display_changed_at = time.time()
+            self.snapshot_at = time.time()
 
     BOOT_TIMEOUT = 900.0     # wall seconds the port may take to print `ready` (boot + load)
 
@@ -1949,11 +1970,14 @@ class Panel:
         overrides the boot text (the card re-insert keeps its own)."""
         self.phase = phase or ("booting the port" + (" (boot + project load, ~1 min)" if self.project else ""))
         log = pathlib.Path(str(self.card_file)).with_suffix(".port.log") if self.card_file else None
+        if self.stop_event.is_set():
+            raise PortDied("server closing")
         proc = PortProc(self._port_argv(), log_path=log)
+        proc.cancel = self.stop_event
         self.proc = proc
         try:
             try:
-                proc.wait_ready(self.BOOT_TIMEOUT)
+                proc.wait_ready(self.BOOT_TIMEOUT, cancel=self.stop_event)
             except PortDied as e:
                 if not (self.sound_wanted and self.rt_wanted and "--dsp-rt" in proc.argv):
                     raise
@@ -1966,10 +1990,13 @@ class Panel:
                 self.backend_note = ((self.backend_note + "; ") if self.backend_note else "") + \
                     f"the --dsp-rt child did not boot ({e}); respawned with the lockstep --dsp"
                 print(f"panel: {self.backend_note}")
+                if self.stop_event.is_set():
+                    raise PortDied("server closing")
                 proc.kill()
                 proc = PortProc(self._port_argv(), log_path=log)
+                proc.cancel = self.stop_event
                 self.proc = proc
-                proc.wait_ready(self.BOOT_TIMEOUT)
+                proc.wait_ready(self.BOOT_TIMEOUT, cancel=self.stop_event)
             self.sound_rt = "--dsp-rt" in proc.argv
             rt = PortRt(proc, meter=self.meter)
             self.rt = rt
@@ -2004,7 +2031,8 @@ class Panel:
             self._poll(rt)
             self._snapshot(rt.uc)
         except BaseException:
-            proc.kill()
+            if not self.stop_event.is_set():
+                proc.kill()
             raise
 
     def _boot(self):
@@ -2013,7 +2041,7 @@ class Panel:
         except PortDied as e:
             if self.booted:
                 raise
-            if self.sound_wanted:
+            if self.sound_wanted and not self.stop_event.is_set():
                 # The --dsp child did not come up (a binary built without
                 # the cores, a DSP boot that faults): once more without
                 # them -- the panel works, the sound does not, and
@@ -2033,6 +2061,8 @@ class Panel:
         fresh one. Emulated state starts over -- boot, project load, the
         clock dialog -- and the decoder with it; clicks queued meanwhile
         run against the new child once it is ready."""
+        if self.stop_event.is_set():
+            return False
         self.restarts += 1
         self.fault = f"port: {why}; respawned ({self.restarts})"
         return self._reboot_port(f"restarting the port ({why})")
@@ -2044,15 +2074,19 @@ class Panel:
         clock dialog is closed; /status "booted" is false meanwhile (it
         read true through a re-insert with the screen blank, 12 Sep 2026).
         True when the port is up again."""
+        if self.stop_event.is_set():
+            return False
         self._stop_child()
         for attempt in range(3):
+            if self.stop_event.is_set():
+                return False
             try:
                 self._boot_port(phase)
                 self.phase = "ready"
                 return True
             except PortDied as e:
                 self.fault = f"port: respawn {attempt + 1} failed: {e}"
-                time.sleep(2.0)
+                self.stop_event.wait(2.0)
         self.phase = "failed"
         return False
 
@@ -2389,6 +2423,8 @@ class Panel:
             self.fault = f"boot: {type(e).__name__}: {e}"
             self.phase = "failed"
             return
+        if self.stop_event.is_set():
+            return
         threading.Thread(target=self._watchdog, daemon=True, name="watchdog").start()
         try:
             self.rt.pace(True, self.PACE_RATE)
@@ -2400,9 +2436,9 @@ class Panel:
         else:
             return self._loop_paced()
         # A child without `pace`: the pump below (O15f).
-        while True:
+        while not self.stop_event.is_set():
             try:
-                while True:
+                while not self.stop_event.is_set():
                     try:
                         act = self.actions.get_nowait()
                     except queue.Empty:
@@ -2413,6 +2449,8 @@ class Panel:
                         self._drain_audio(self.rt)   # what the action's own runs rendered
                     finally:
                         self.busy_since = None
+                if self.stop_event.is_set():
+                    return
                 rt = self.rt        # after the actions: a card re-insert replaces it
                 t = time.perf_counter()
                 self.busy_since = t
@@ -2496,7 +2534,7 @@ class Panel:
         1.00x on this Mac since O15a-e; --dsp: ~0.15x)."""
         armed = None            # the PortRt whose pacer is on
         prev = None             # (ms, busy) of the previous pacestatus, for the speed meter
-        while True:
+        while not self.stop_event.is_set():
             try:
                 # Actions first: a blocking get, so a queued click is served
                 # the moment it arrives (idle key round trip ~1 ms) instead of
@@ -2506,7 +2544,7 @@ class Panel:
                 except queue.Empty:
                     act = None
                 ran = False
-                while act is not None:
+                while act is not None and not self.stop_event.is_set():
                     self.busy_since = time.perf_counter()
                     try:
                         act()
@@ -2519,8 +2557,12 @@ class Panel:
                         act = self.actions.get_nowait()
                     except queue.Empty:
                         act = None
+                if self.stop_event.is_set():
+                    return
                 if self.card_ejected or self.rt is None:
                     continue            # O19: the card is on the Mac; no child to serve
+                if self.stop_event.is_set():
+                    return
                 rt = self.rt        # after the actions: a respawn / re-insert / sound switch replaces it
                 if ran:
                     self._card_flush(rt, force=True)    # O19: the batch's writes on disk
@@ -2899,7 +2941,7 @@ class Panel:
             return 0
         got = 0
         t0 = time.perf_counter()
-        while True:
+        while not self.stop_event.is_set():
             rep = rt.proc.command(f"audio read {AUDIO_READ_MAX}", "audio")
             head, _, hexs = rep[6:].partition(" ")          # "audio <frames> <hex>"
             n = int(head)
@@ -3271,8 +3313,9 @@ class Panel:
         12 Sep 2026). An early-ended burst is also charged its whole
         quantum (Rtos.step: instrs += n), a timing glitch for nothing, so
         emu_stop() is gone."""
-        while True:
-            time.sleep(1.0)
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(1.0):
+                return
             t0 = self.busy_since
             if t0 is not None and time.perf_counter() - t0 > self.ACTION_LIMIT:
                 self.aborted = (self.aborted or 0) + 1
@@ -3309,7 +3352,7 @@ class Panel:
         self.abort = False
         why = "done"
         slice_ms = getattr(rt, "SLICE_MS", self.RUN_SLICE_MS)   # the port: a round trip per slice
-        while rt.sample < end:
+        while rt.sample < end and not self.stop_event.is_set():
             left = (end - rt.sample) / SAMPLE_HZ * 1000.0
             # O15f: the child ends the slice itself when the budget is
             # spent (`run <ms> wall <s>`), so the slice, not just the
@@ -3330,6 +3373,8 @@ class Panel:
 
     def do(self, fn, timeout=30.0):
         """Run fn(rt) on the emu thread, return (ok, result-or-error)."""
+        if self.stop_event.is_set():
+            return False, "server closing"
         if self.card_ejected:
             return False, f"the card is ejected (mounted at {self.card_mount}): insert it first"
         done = threading.Event()
@@ -3451,10 +3496,174 @@ def _pace_json(st):
             "busy_s": f("busy"), "stop": st.get("stop")}
 
 
+VIEW_ROUTES = frozenset(("/", "/skin.js", "/screen.png", "/screen.txt", "/status", "/map", "/leds", "/leds/stream"))
+EMULATOR_ROUTES = frozenset("/samples /samples/add /samples/upload /samples/remove /samples/commit /card /card/eject /card/insert /audio/status /audio/pcm /audio.wav /audio/devices /audio/output /audio/enable /peek /rtstatus /port /keys /key /knob /knob/reset /knob/press /xfader /midi /tap /transport /poke_trig /project /stack /run".split())
+
+
+class PortPanelBackend:
+    """Read-view adapter; all emulator controls remain on the actual Panel."""
+    source = "port"
+    capabilities = frozenset(("screen", "leds", "controls", "midi", "memory", "emulator", "samples", "card", "audio"))
+
+    def __init__(self, panel, *, model="mki"):
+        self.panel, self.model = panel, model
+        self.closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._blank_png = _png_rgb(128, 64, [LCD_OFF * 128] * 64)
+
+    def supports(self, capability):
+        return capability in self.capabilities
+
+    def snapshot(self):
+        p = self.panel
+        with p.lock:
+            bits, ids = bytes(p.led_bits), dict(p.led_ids)
+            if p.link is not None:
+                bits = bytes(p.link.led_rows.get(i, 0) for i in range(17))
+                ids = dict(p.link.leds)
+            return ViewSnapshot(p.frame or self._blank_png,
+                                p.screen_txt or ("." * 128 + "\n") * 64,
+                                LedSnapshot(bits, tuple(ids.items())), p.seq, self.model,
+                                self.capabilities, p.snapshot_at, p.display_changed_at)
+
+    def status(self):
+        p = self.panel
+        with p.lock:
+            status = {"booted": p.booted, "seq": p.seq, "ran_ms": p.ran_ms,
+                "fault": p.fault, "image": str(p.image), "phase": p.phase,
+                "backend": p.backend, "backend_note": p.backend_note or None,
+                # emulated ms per wall s over the last 5 s of run() calls;
+                # idle runs skip to the next timer, so idle reads high
+                "speed": p.meter.value,
+                # O15f: x real time by the WALL clock (emulated ms per
+                # wall s over the last second / 1000): 1.0 = the unit's
+                # clock; None before the pacer is up
+                "rt": p.rtmeter.value,
+                "pace": _pace_json(p.pace),
+                "nice": host_nice(),            # > 0: started as a zsh background job (BG_NICE); slower under load
+                "restarts": p.restarts,
+                "card_busy": p.card_busy,       # a /samples/commit re-insert in progress
+                "clock": p.clock_note,          # what the boot-time YES found
+                "sound": p.sound,               # the child runs the DSP cores and its main out is captured
+                "sound_rt": p.sound_rt,         # O17: ... under --dsp-rt (real time); False = the lockstep --dsp (~0.2x) or no cores
+                "sound_note": p.sound_note,
+                "frame_always": p.frame_always, # 23 Sep 2026: frame mode on from boot (manual [TRIG] trigs sound while stopped)
+                "pid": os.getpid(),             # 23 Sep 2026: so the app can retire a stale server it finds on the port
+                "script_mtime": SCRIPT_MTIME,   # this file's mtime when the server started: older than the file = stale
+                "playing": p.playing,           # PLAY pressed, STOP not yet
+                # O19: the card
+                "card": str(p.card_file) if p.card_file else None,
+                "card_mode": "persistent" if p.card_persistent else "fresh",
+                "card_rw": p.card_rw,             # the child writes through to the file
+                "card_ejected": p.card_ejected,
+                "card_mount": p.card_mount,
+                "project": {"set": p.project[0], "name": p.project[1]} if p.project else None}
+        status.update(source=self.source, read_only=False, capabilities=sorted(self.capabilities))
+        return status
+
+    def close(self):
+        with self._close_lock:
+            if self.closed.is_set():
+                return
+            self.closed.set()
+            pn = self.panel
+            pn.stop_event.set()       # suppress watchdog, actions and every respawn first
+            pn.abort = True
+            # Stop the sole owner before closing takes/audio/card. Normal commands
+            # have a bounded backstop; cancelled boot waits also wake promptly.
+            if pn.worker is not threading.current_thread():
+                pn.worker.join()
+            pn._close_take(None)
+            if pn.output is not None:
+                pn.output.stop("server exit")
+            if pn.card_ejected and pn.card_mount:
+                print(f"panel: exiting with the card still mounted at {pn.card_mount} -- `hdiutil detach` it before the next start")
+            if pn.proc is not None:
+                if pn.card_rw:
+                    try:
+                        pn.proc.command("card flush", "card", timeout=10.0, closing=True)
+                    except (PortDied, PortError):
+                        pass
+                pn.proc.quit()
+            pn._save_sidecar()
+
+
 class Handler(BaseHTTPRequestHandler):
-    panel: Panel = None
+    backend: PanelBackend | None = None
+    panel: Panel | None = None
     html: bytes = b""
     model: str = "mki"
+
+    def _hardware_policy(self, path, *, get=False):
+        if self.backend.source != "hardware":
+            return False
+        if path in EMULATOR_ROUTES:
+            self._json({"ok": False, "code": "unsupported_backend_operation",
+                        "error": f"{path} is unavailable in hardware mode (read-only physical panel mirror)"}, 409)
+        elif path not in VIEW_ROUTES or not get:
+            self._send(404, b"?", "text/plain")
+        else:
+            self._view_get(path)
+        return True
+
+    def _view_get(self, path):
+        backend = self.backend
+        if path == "/":
+            page = pathlib.Path(__file__).parent / "panel.html"
+            self._send(200, page.read_bytes() if page.exists() else self.html, "text/html; charset=utf-8")
+        elif path == "/skin.js":
+            self._send(200, skin_js(), "application/javascript; charset=utf-8")
+        elif path == "/status":
+            status = backend.status()
+            status.update(pid=os.getpid(), script_mtime=SCRIPT_MTIME)
+            self._json(status)
+        elif path == "/map":
+            mp = pathlib.Path(__file__).parent / "key_map.json"
+            mapping = json.loads(mp.read_bytes()) if mp.exists() else {}
+            mapping["model"] = backend.status().get("model") if backend.source == "hardware" else self.model
+            self._json(mapping)
+        elif path in ("/screen.png", "/screen.txt"):
+            view = backend.snapshot()
+            if view is None:
+                self._json({"ok": False, "code": "frame_unavailable"}, 503)
+            elif path == "/screen.png":
+                self._send(200, view.png, "image/png")
+            else:
+                self._send(200, view.text.encode(), "text/plain; charset=utf-8")
+        elif not backend.supports("leds"):
+            self._json({"ok": False, "code": "capability_unavailable"}, 409)
+        elif path == "/leds":
+            view = backend.snapshot()
+            if view is None or view.leds is None:
+                self._json({"ok": False, "code": "frame_unavailable"}, 503)
+            else:
+                self._json(led_payload(view.leds))
+        elif path == "/leds/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            last, quiet = None, 0.0
+            try:
+                while not ((backend.source == "port" and backend.closed.is_set()) or
+                           (backend.source == "hardware" and backend.status().get("connection_state") == "closed")):
+                    view = backend.snapshot()
+                    cur = json.dumps(led_payload(view.leds), separators=(",", ":")) if view is not None and view.leds is not None else None
+                    if cur is not None and cur != last:
+                        self.wfile.write(f"data: {cur}\n\n".encode())
+                        self.wfile.flush()
+                        last, quiet = cur, 0.0
+                    else:
+                        quiet += 0.02
+                        if quiet >= 5.0:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            quiet = 0.0
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
 
     def log_message(self, *a):  # quiet
         pass
@@ -3646,6 +3855,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _, q = self.path.partition("?")
+        if self._hardware_policy(path):
+            return
         args = dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
         if path == "/samples/upload":
             n = int(self.headers.get("Content-Length") or 0)
@@ -3655,60 +3866,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"?", "text/plain")
 
     def do_GET(self):
-        p = self.panel
         path, _, q = self.path.partition("?")
+        if self._hardware_policy(path, get=True):
+            return
+        if path in VIEW_ROUTES:
+            self._view_get(path)
+            return
+        p = self.panel
         args = dict(kv.split("=", 1) for kv in q.split("&") if "=" in kv)
-        if path == "/":
-            # read per request: a page fix must not need a server (or app) restart
-            page = pathlib.Path(__file__).parent / "panel.html"
-            self._send(200, page.read_bytes() if page.exists() else self.html, "text/html; charset=utf-8")
-        elif path == "/skin.js":
-            # The panel's face: octemu's generated MKII skin (tools/panel/skin/
-            # gen_svg.py, Mark Roberts, MIT) in octabam's dark palette, as one
-            # script the page loads before it builds (window.SKIN = the element
-            # geometry, window.SKIN_SVG = the drawing). Generated once per
-            # server into out/panel_skin/.
-            self._send(200, skin_js(), "application/javascript; charset=utf-8")
-        elif path == "/screen.png":
-            with p.lock:
-                self._send(200, p.frame or _png_rgb(128, 64, [LCD_OFF * 128] * 64), "image/png")
-        elif path == "/screen.txt":
-            # the frame as 64 lines of '#' (dark) / '.' -- for agents that grep, not view
-            with p.lock:
-                txt = p.screen_txt or ("." * 128 + "\n") * 64
-            self._send(200, txt.encode(), "text/plain; charset=utf-8")
-        elif path == "/status":
-            with p.lock:
-                self._json({"booted": p.booted, "seq": p.seq, "ran_ms": p.ran_ms,
-                            "fault": p.fault, "image": str(p.image), "phase": p.phase,
-                            "backend": p.backend, "backend_note": p.backend_note or None,
-                            # emulated ms per wall s over the last 5 s of run() calls;
-                            # idle runs skip to the next timer, so idle reads high
-                            "speed": p.meter.value,
-                            # O15f: x real time by the WALL clock (emulated ms per
-                            # wall s over the last second / 1000): 1.0 = the unit's
-                            # clock; None before the pacer is up
-                            "rt": p.rtmeter.value,
-                            "pace": _pace_json(p.pace),
-                            "nice": host_nice(),            # > 0: started as a zsh background job (BG_NICE); slower under load
-                            "restarts": p.restarts,
-                            "card_busy": p.card_busy,       # a /samples/commit re-insert in progress
-                            "clock": p.clock_note,          # what the boot-time YES found
-                            "sound": p.sound,               # the child runs the DSP cores and its main out is captured
-                            "sound_rt": p.sound_rt,         # O17: ... under --dsp-rt (real time); False = the lockstep --dsp (~0.2x) or no cores
-                            "sound_note": p.sound_note,
-                            "frame_always": p.frame_always, # 23 Sep 2026: frame mode on from boot (manual [TRIG] trigs sound while stopped)
-                            "pid": os.getpid(),             # 23 Sep 2026: so the app can retire a stale server it finds on the port
-                            "script_mtime": SCRIPT_MTIME,   # this file's mtime when the server started: older than the file = stale
-                            "playing": p.playing,           # PLAY pressed, STOP not yet
-                            # O19: the card
-                            "card": str(p.card_file) if p.card_file else None,
-                            "card_mode": "persistent" if p.card_persistent else "fresh",
-                            "card_rw": p.card_rw,             # the child writes through to the file
-                            "card_ejected": p.card_ejected,
-                            "card_mount": p.card_mount,
-                            "project": {"set": p.project[0], "name": p.project[1]} if p.project else None})
-        elif path.startswith("/samples"):
+        if path.startswith("/samples"):
             self._samples(path, args)
         elif path == "/card":
             # O19: the card as a whole: file, sidecar, names, write-back, the
@@ -3808,13 +3974,6 @@ class Handler(BaseHTTPRequestHandler):
                             n=int(args.get("n", "1")), hold=float(args.get("hold", "50")),
                             gap=float(args.get("gap", "150")))
             self._json({"ok": ok, "result": str(res)})
-        elif path == "/map":
-            # the identified panel map (keys, knobs, leds): tools/panel/key_map.json
-            # plus "model": "mkii" | "mki", the model the child runs as
-            mp = pathlib.Path(__file__).parent / "key_map.json"
-            m = json.loads(mp.read_bytes()) if mp.exists() else {}
-            m["model"] = Handler.model
-            self._send(200, json.dumps(m).encode(), "application/json")
         elif path == "/transport":
             ok, res = p.transport(args.get("k", ""))
             self._json({"ok": ok, "result": str(res)})
@@ -3833,36 +3992,6 @@ class Handler(BaseHTTPRequestHandler):
                 if f is not None and th is not threading.current_thread():
                     dump[th.name] = "".join(traceback.format_stack(f)[-12:])
             self._send(200, "\n\n".join(f"== {k}\n{v}" for k, v in dump.items()).encode(), "text/plain")
-        elif path == "/leds":
-            # "bits": one byte per LED bitmap row (rows 0..16 of the 0x2r /
-            # 0xa0+r messages, decoded by panel_link) -- key_map.json's leds
-            # are [row, bit] into exactly this. "ids": the 0x3n <id> level
-            # nibbles. Without panel_link the old naive parser's bytes remain.
-            self._json(p.led_payload())
-        elif path == "/leds/stream":
-            # Server-sent events: one `data:` line per LED CHANGE, checked
-            # every 20 ms. The page used to fetch /leds behind its 350 ms
-            # status poll and missed two of every three 125 ms steps of the
-            # running light (13 Sep 2026); pushed changes show every step.
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            last, quiet = None, 0.0
-            try:
-                while True:
-                    cur = json.dumps(p.led_payload(), separators=(",", ":"))
-                    if cur != last:
-                        self.wfile.write(f"data: {cur}\n\n".encode()); self.wfile.flush()
-                        last, quiet = cur, 0.0
-                    else:
-                        quiet += 0.02
-                        if quiet >= 5.0:                 # keepalive: a comment line
-                            self.wfile.write(b": ping\n\n"); self.wfile.flush(); quiet = 0.0
-                    time.sleep(0.02)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                return
         elif path == "/run":
             # sliced, wall-bounded (run_ms): a plain rt.run(ms=5000) in frame
             # mode held the emulator for minutes (12 Sep 2026)
@@ -3874,7 +4003,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
+    ap.add_argument("--source", choices=("port", "hardware"), default="port")
+    ap.add_argument("--usb-device", default=None, help="serial:<serial> or topology:<bus>-<port>.<port>")
+    ap.add_argument("--usb-poll-hz", type=float, default=5.0)
     ap.add_argument("--image", default=None,
                     help="MAIN OS image (default: out/mainos_bus.bin if built, else the raw stock image)")
     ap.add_argument("--project", default=None, help="project dir to stage onto the card")
@@ -3905,12 +4037,18 @@ def main():
                     help="run the port as an MKI (no --mkii): the MKI keymap, no PROJ/PART/AED/ARR/REC3 keys. "
                          "Default: the port child runs --mkii (docs/firmware/PANEL.md)")
     a = ap.parse_args()
-
-    # Default to the STOCK image: out/mainos_bus.bin is whatever the last
-    # build or gate left there (verify_burn leaves a probe build that never
-    # reaches the UI -- a blank screen, 11 Sep 2026). Pass --image to test
-    # a built remix deliberately.
-    image = a.image or str(ROOT / "out/raw/section_3_MAIN_OS.bin")
+    if not math.isfinite(a.usb_poll_hz) or a.usb_poll_hz <= 0:
+        ap.error("--usb-poll-hz must be finite and positive")
+    if a.usb_device is not None and not (
+            re.fullmatch(r"serial:[^\s]+", a.usb_device) or
+            re.fullmatch(r"topology:[1-9][0-9]*-[1-9][0-9]*(?:\.[1-9][0-9]*)*", a.usb_device)):
+        ap.error("--usb-device requires serial:<serial> or topology:<bus>-<port>.<port>")
+    if a.source == "hardware":
+        emulator_options = {"--image", "--project", "--set", "--name", "--card", "--midi-clock",
+                            "--port-bin", "--port-arg", "--audio", "--sound", "--mki"}
+        explicit = sorted({arg.split("=", 1)[0] for arg in sys.argv[1:]} & emulator_options)
+        if explicit:
+            ap.error("hardware mode is read-only; emulator options unavailable: " + ", ".join(explicit))
 
     # Bind FIRST, before anything below touches the port's files: the pool
     # wipe, the staging tree and the card image are all keyed by port, and a
@@ -3924,6 +4062,35 @@ def main():
         srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     except OSError as e:
         sys.exit(f"panel: port {a.port}: {e}")
+
+    Handler.panel = None
+    Handler.backend = None
+    try:
+        if a.source == "hardware":
+            # Import only after source validation and the successful loopback bind.
+            from hardware_backend import HardwareBackend
+            Handler.backend = HardwareBackend(selector=a.usb_device, poll_hz=a.usb_poll_hz)
+            Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
+            print(f"panel: http://localhost:{a.port}/   source=hardware (read-only)")
+        else:
+            _start_port(a)
+        def _term(signum, frame):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, _term)
+        if a.source == "port" and (host_nice() or 0) > 0:
+            print(f"panel: running at nice {host_nice()} -- the unit may be slower under load")
+        srv.serve_forever()
+    finally:
+        try:
+            if Handler.backend is not None:
+                Handler.backend.close()
+        finally:
+            srv.server_close()
+
+
+def _start_port(a):
+    # Default to the user's stock image, as before.
+    image = a.image or str(ROOT / "out/raw/section_3_MAIN_OS.bin")
 
     # The sample pool (SamplePool): the set's AUDIO folder the card is built
     # from, one per server port. The project's own samples seed it as they
@@ -4071,41 +4238,12 @@ def main():
                           pool=pool, card_builder=builder, staged_audio=staged_audio,
                           sound=sound, takes_dir=takes_dir, card_persistent=card_path is not None,
                           card_rw=card_rw, card_meta=card_meta)
+    Handler.backend = PortPanelBackend(Handler.panel, model=model)
     Handler.html = (pathlib.Path(__file__).parent / "panel.html").read_bytes()
     print(f"panel: http://localhost:{a.port}/   image={image}   backend={backend}   model={model}"
           f"   sound={'on' if Handler.panel.sound_wanted else 'off'} (takes in {takes_dir})"
           f"   card={card_file} ({'persistent, write-back ' + ('on' if card_rw else 'OFF') if card_path else 'fresh per port'})")
 
-    # O19: SIGTERM (the app's quit, a kill) ends serve_forever through the
-    # finally below instead of killing the interpreter outright, so the
-    # child gets `card flush` + `quit` (it fsyncs before its ok) and the
-    # sidecar is written. Python's default action for SIGTERM is to die at
-    # once -- the app's README said so, and it was true.
-    def _term(signum, frame):
-        raise SystemExit(0)
-    signal.signal(signal.SIGTERM, _term)
-    if (host_nice() or 0) > 0:
-        print(f"panel: running at nice {host_nice()} (a zsh `&` job: BG_NICE) -- the unit will be slower "
-              f"whenever anything else wants the CPU; start the server in the foreground, or `unsetopt BG_NICE`")
-    try:
-        srv.serve_forever()
-    finally:
-        pn = Handler.panel
-        pn._close_take(None)     # a take open at exit stays a valid WAV
-        if pn.output is not None:
-            pn.output.stop("server exit")
-        if pn.card_ejected and pn.card_mount:
-            # the card stays mounted on the Mac (the user may be copying):
-            # say so; the next start on it needs it detached first
-            print(f"panel: exiting with the card still mounted at {pn.card_mount} -- `hdiutil detach` it before the next start")
-        if pn.proc is not None:
-            if pn.card_rw:
-                try:
-                    pn.proc.command("card flush", "card", timeout=10.0)
-                except (PortDied, PortError):
-                    pass
-            pn.proc.quit()
-        pn._save_sidecar()
 
 
 if __name__ == "__main__":

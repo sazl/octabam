@@ -14,6 +14,7 @@ The value and its address are kept in <out>/saved.json between the two.
 """
 import argparse
 import json
+import struct
 import pathlib
 import sys
 import time
@@ -85,14 +86,52 @@ def check(ok, what, detail=""):
     return ok
 
 
+def observe_hardware(url, out, status):
+    """Observe the physical cache without constructing an emulator driver."""
+    if not status.get("has_frame"):
+        raise SystemExit("panel_check: hardware has no verified frame; wait for a live mirror snapshot")
+    png = get(url + "/screen.png")
+    txt = get(url + "/screen.txt")
+    txt = txt.decode() if isinstance(txt, bytes) else str(txt)
+    valid_png = (isinstance(png, bytes) and png[:8] == b"\x89PNG\r\n\x1a\n" and
+                 len(png) >= 24 and png[12:16] == b"IHDR" and struct.unpack(">II", png[16:24]) == (128, 64))
+    valid_txt = len(txt.splitlines()) == 64 and all(len(line) == 128 for line in txt.splitlines())
+    fails = int(not check(valid_png and valid_txt, "the cached hardware screen is 128x64"))
+    if valid_png:
+        (out / "hardware.png").write_bytes(png)
+    (out / "hardware.txt").write_text(txt)
+    if "leds" in status.get("capabilities", []):
+        leds = get(url + "/leds")
+        fails += not check(isinstance(leds, dict) and isinstance(leds.get("bits"), str)
+                           and isinstance(leds.get("ids"), dict), "the mirrored LED cache is available")
+        (out / "hardware-leds.json").write_text(json.dumps(leds, indent=2))
+    status = get(url + "/status")
+    fails += not check(status.get("connection_state") == "live", "physical mirror contact is live",
+                       str(status.get("connection_state")))
+    (out / "hardware-status.json").write_text(json.dumps(status, indent=2))
+    print(f"panel_check hardware: {fails} failure(s); read-only observations in {out}")
+    return 1 if fails else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--source", choices=("port", "hardware"), default="port")
     ap.add_argument("--url", default="http://localhost:8563")
     ap.add_argument("--out", default="out/panel_check")
     ap.add_argument("--phase", choices=("all", "persist"), default="all")
     a = ap.parse_args()
+    url = a.url.rstrip("/")
+    status = get(url + "/status")
+    actual_source = status.get("source") or status.get("backend")
+    if actual_source != a.source or status.get("backend") != a.source:
+        raise SystemExit(f"panel_check: requested {a.source}, server source/backend is "
+                         f"{actual_source!r}/{status.get('backend')!r}; refusing emulator actions")
+    if a.source == "hardware" and a.phase != "all":
+        ap.error("hardware supports observation only; --phase persist is emulator-only")
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.source == "hardware":
+        return observe_hardware(url, out, status)
     p = Panel(a.url, out)
     s = p.wait_booted()
     fails = 0
