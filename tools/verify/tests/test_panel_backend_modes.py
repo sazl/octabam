@@ -96,6 +96,7 @@ class PortAdapter(unittest.TestCase):
         p.restarts = 2; p.card_busy = False; p.clock_note = 'clock'; p.sound = True; p.sound_rt = True; p.sound_note = 'sound'; p.frame_always = True; p.playing = True
         p.card_file = pathlib.Path('card'); p.card_persistent = True; p.card_rw = True; p.card_ejected = False; p.card_mount = None; p.project = ('SET','PROJECT')
         p.actions = ps.queue.Queue()
+        p.output_lock = threading.Lock()
         return p
     def test_port_status_retains_every_legacy_field_and_values(self):
         p = self.panel(); b = ps.PortPanelBackend(p, model='mkii')
@@ -170,3 +171,90 @@ class StoppedReboot(unittest.TestCase):
         p = PortAdapter().panel(); p.stop_event.set()
         p._stop_child = lambda: self.fail('stopped reboot cleans child')
         self.assertFalse(p._reboot_port('reboot'))
+
+class AudioOutputCloseRace(unittest.TestCase):
+    """A request-owned stream must not outlive the selected backend owner."""
+    def panel(self):
+        p = PortAdapter().panel()
+        p.output = None; p.output_note = None; p.output_lock = threading.Lock()
+        p.audio_mode = 'main'; p.sound_busy = False
+        p.worker = types.SimpleNamespace(join=lambda: None)
+        p._close_take = lambda rt: None
+        p.proc = None; p._save_sidecar = lambda: None
+        return p
+    def output(self):
+        class Output:
+            name = 'recording output'; index = 1; channels = 2
+            running = True
+            def __init__(self):
+                self.stops = []
+            def stop(self, reason=None):
+                self.stops.append(reason); self.running = False
+            def channel_map(self):
+                return ['main L/R']
+            def status(self):
+                return {'running':self.running, 'latency_ms':0}
+        return Output()
+    def devices(self):
+        return [{'index':1,'name':'recording output','channels':2}]
+    def test_in_flight_constructor_cannot_publish_running_stream_after_close(self):
+        p = self.panel(); backend = ps.PortPanelBackend(p)
+        entered = threading.Event(); release = threading.Event(); closing = threading.Event(); close_finished = threading.Event()
+        p._close_take = lambda rt: closing.set()
+        output = self.output(); replies = []; errors = []
+        def construct(*args):
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError('test constructor was not released')
+            return output
+        def create():
+            try:
+                replies.append(p.set_output('1'))
+            except BaseException as error:
+                errors.append(error)
+        def close():
+            try:
+                backend.close()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                close_finished.set()
+        creator = threading.Thread(target=create, daemon=True)
+        closer = threading.Thread(target=close, daemon=True)
+        with patch.object(ps, 'sounddevice', return_value=(object(), None)), patch.object(ps, 'audio_devices', return_value=(self.devices(),None)), patch.object(ps, 'AudioOutput', side_effect=construct), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                creator.start(); self.assertTrue(entered.wait(1))
+                closer.start(); self.assertTrue(closing.wait(1))
+                self.assertTrue(p.stop_event.is_set())
+                self.assertFalse(close_finished.wait(0.1), 'close returned with constructor-owned audio still live')
+            finally:
+                release.set(); creator.join(2); closer.join(2)
+        self.assertFalse(creator.is_alive()); self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(output.running, 'created output remains live after backend close')
+        self.assertIsNone(p.output)
+        self.assertEqual(output.stops, ['server exit'])
+        self.assertFalse(replies[0][0], 'closed request reported a newly running output')
+        self.assertTrue(p.actions.empty(), 'closed request queued emulator capture work')
+        backend.close()
+        self.assertEqual(output.stops, ['server exit'])
+    def test_closed_panel_rejects_creation_before_audio_enumeration(self):
+        p = self.panel(); backend = ps.PortPanelBackend(p); backend.close()
+        with patch.object(ps, 'sounddevice', side_effect=AssertionError('enumerated after close')), patch.object(ps, 'AudioOutput', side_effect=AssertionError('created after close')):
+            ok, reply = p.set_output('1')
+        self.assertFalse(ok); self.assertEqual(reply['error'],'server closing')
+        self.assertIsNone(p.output); self.assertTrue(p.actions.empty())
+    def test_capture_request_does_not_queue_after_close(self):
+        p = self.panel(); p.stop_event.set()
+        p._queue_capture(ps.OUTPUT_CAPTURE)
+        self.assertTrue(p.actions.empty())
+    def test_open_panel_keeps_device_reuse_and_output_off_behavior(self):
+        p = self.panel(); output = self.output()
+        with patch.object(ps, 'sounddevice', return_value=(object(),None)), patch.object(ps, 'audio_devices', return_value=(self.devices(),None)), patch.object(ps, 'AudioOutput', return_value=output) as constructor, contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(p.set_output('1')[0])
+            self.assertIs(p.output,output)
+            self.assertTrue(p.set_output('1')[0])
+            constructor.assert_called_once()
+            self.assertTrue(p.set_output('off')[0])
+        self.assertIsNone(p.output)
+        self.assertEqual(output.stops,['stopped: /audio/output?device=off'])

@@ -3011,7 +3011,7 @@ class Panel:
         """The child's capture to `mode`, as an action, when there is a
         child to ask; a child that boots later (respawn, re-insert, sound
         switch) picks the mode itself in _audio_start."""
-        if not self.booted or self.card_ejected or self.card_busy or self.sound_busy:
+        if self.stop_event.is_set() or not self.booted or self.card_ejected or self.card_busy or self.sound_busy:
             return
 
         def act():
@@ -3041,6 +3041,8 @@ class Panel:
         a device on, main L/R without -- through an emu-thread action. (ok, reply)."""
         spec = (spec or "").strip()
         with self.output_lock:
+            if self.stop_event.is_set():
+                return False, {"ok": False, "error": "server closing", "output": self.output_status()}
             cur = self.output
             if spec.lower() in ("", "off", "none"):
                 if cur is not None:
@@ -3085,6 +3087,11 @@ class Panel:
                 print(f"panel: audio output: {self.output_note}")
                 self._queue_capture("main")
                 return False, {"ok": False, "error": self.output_note, "output": self.output_status()}
+            # close() sets stop_event before waiting on this same lock. A
+            # stream created in flight belongs to this request until published.
+            if self.stop_event.is_set():
+                out.stop("server exit")
+                return False, {"ok": False, "error": "server closing", "output": self.output_status()}
             self.output = out
             self.output_note = None
             print(f"panel: audio output -> {out.name} ({out.channels} of {dev['channels']} channels: "
@@ -3574,8 +3581,9 @@ class PortPanelBackend:
             if pn.worker is not threading.current_thread():
                 pn.worker.join()
             pn._close_take(None)
-            if pn.output is not None:
-                pn.output.stop("server exit")
+            with pn.output_lock:
+                if pn.output is not None:
+                    pn.output.stop("server exit")
             if pn.card_ejected and pn.card_mount:
                 print(f"panel: exiting with the card still mounted at {pn.card_mount} -- `hdiutil detach` it before the next start")
             if pn.proc is not None:
