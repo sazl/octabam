@@ -11,6 +11,7 @@ Where each doc is, by who reads it. A module's own page is
 | [guide/BUILDING.md](guide/BUILDING.md) | what to install (macOS, Linux/WSL2), the toolchain, your own OS 1.40C, building an image, flashing from the card or over MIDI, after the flash, recovery, back to stock |
 | [../remixes/README.md](../remixes/README.md) | the remixes you can flash, with where each has run |
 | [guide/REMIXER.md](guide/REMIXER.md) | composing your own remix: the `make remix` TUI, or a `remix.py` by hand |
+| [guide/USB_PANEL_MIRROR.md](guide/USB_PANEL_MIRROR.md) | experimental physical USB panel viewer: safe host setup, identity, read-only limits and recovery |
 
 ## Writing a module or changing the build
 
@@ -35,6 +36,10 @@ Where each doc is, by who reads it. A module's own page is
 | [../tools/ghidra/README.md](../tools/ghidra/README.md) | the Ghidra project over the OS and both DSP payloads |
 
 ## The firmware, reverse-engineered
+
+[firmware/USB_PANEL_MIRROR.md](firmware/USB_PANEL_MIRROR.md) records the
+accepted-wire observer, corrected boot boundary, protocol, publication and
+the distinction between port evidence and unmeasured hardware budgets.
 
 [firmware/](firmware/): OS 1.40C as measured here. Start at
 [ARCHITECTURE.md](firmware/ARCHITECTURE.md); [CHIP.md](firmware/CHIP.md)

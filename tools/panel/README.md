@@ -25,6 +25,39 @@ REC3 have no MKI equivalent.
 
 ## In octabam
 
+The default `--source port` keeps the emulator, project/card persistence and
+controls described here. `--source hardware` is an experimental read-only USB
+viewer: it needs compatible mirror firmware on the device, PyUSB 1.3.1 and native
+libusb, but no local firmware image, REMIX or OT_PROJECT. The native macOS app
+remains emulator-only and refuses a hardware launcher request. Use the browser
+for a physical panel; the [operator guide](../../docs/guide/USB_PANEL_MIRROR.md)
+covers device-specific permissions, identity, reconnect and current proof limits.
+
+```sh
+uv sync --extra emu
+make panel-hardware USB_DEVICE='serial:UNIT_SERIAL' USB_POLL_HZ=5
+make panel-hardware USB_DEVICE='topology:1-2.3' PANEL_PORT=8571
+make test-panel                                  # firmware-free host tests
+```
+
+`HardwareBackend(selector=None, poll_hz=5)` owns one USB worker; browser tabs
+share its immutable cached view. Polling follows firmware limits and INFO
+heartbeats keep contact separate from display changes. With no serial identity,
+restart explicitly after disconnect to adopt a device; topology is a location,
+not unit identity. Ctrl-C cancels the worker and closes the server. Five polls
+per second is the default, not evidence of ten visible updates per second.
+Physical latency/audio headroom and Windows driver coexistence are unmeasured.
+
+Hardware serves only `/`, `/skin.js`, `/screen.png`, `/screen.txt`, `/status`,
+`/map`, `/leds`, and `/leds/stream`. Before a validated frame the screen routes
+return `503 frame_unavailable`; unavailable LED state returns
+`409 capability_unavailable`. Every known emulator operation, including mutating
+GET routes and uploads, returns `409 unsupported_backend_operation`; unknown
+routes return 404. Hardware mode has no keys, fader, transport, audio, project,
+card or capture controls. CLI `--usb-device` accepts `serial:<serial>` or
+`topology:<bus>-<port>.<port>`; `--usb-poll-hz` sets the polling rate. Incompatible
+emulator arguments are rejected before starting assets or acquiring USB.
+
 `tools/emu/README.md` lists the other ways to run the port (`make
 emu-live`, scripted runs, the gates).
 

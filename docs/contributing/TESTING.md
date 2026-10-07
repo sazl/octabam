@@ -584,3 +584,61 @@ code.
 [CONTRIBUTING.md "Before you open a PR"](../../CONTRIBUTING.md#before-you-open-a-pr)
 is the list. Flashing your own unit is a separate step:
 [BUILDING.md section 5](../guide/BUILDING.md#5-flash-from-the-card).
+
+## 14. USB mirror and panel source coverage
+
+```sh
+make test-panel                        # stdlib protocol/transport/backend/route discovery, venv when present
+make test-acceptance                   # all firmware-free Python suites, including panel tests
+make test-panel-pyusb                  # requires PyUSB 1.3.1; tests real-library safe disposal without hardware
+make verify-usb-panel REMIX=<carrier> BUILD=<matching image build>
+make reach TESTS=1                     # include the otherwise excluded test carriers
+make reach TESTS=1 FULL=1              # explicit full graph; default stays quick
+```
+
+`test-panel` discovers actual `test_usb_panel_*.py` and `test_panel_*.py` suites.
+Protocol checks cover endian/layout/CRC, allocation and malformed bounded bodies;
+transport checks forbid configuration, reset, interface claims, driver detach,
+endpoint use and unsafe borrowed-context disposal. Backend checks cover atomic
+views, static-screen heartbeat, disconnect, cancellation and bounded resources.
+Server checks cover source arguments, asset-free hardware startup, route reads,
+all known refused operations (including GET mutations/uploads), status and
+multiple viewers. These synthetic suites require no private firmware/project or
+physical device. The dedicated PyUSB CI job installs only PyUSB 1.3.1 and runs
+one Make target; ordinary public acceptance CI remains dependency-light. Actions
+remain SHA-pinned. The existing `ci-emu` job includes generic park/resume and raw
+UART instrument tests without proprietary images.
+
+The owning module declares `verify_usb_panel.py` as an image-stage gate, so it
+runs against the restored selected image after ordinary set/USB checks. The
+focused `verify-usb-panel` target checks that existing final image; it does not
+build a replacement image or substitute a different carrier. Exact REMIX/BUILD
+propagation and the generic image shard job are covered by runner tests. A
+feature-promising carrier with absent symbols/handshake must fail. A missing
+port/image/applicable fixture or `[SKIP]` means blocked strict acceptance;
+timeout, nonzero exit or `[FAIL]` means failure even if a child exits zero. The
+existing strict runner is unchanged.
+
+Reach resolves script-local and package imports through panel tools and routes
+actual test dependencies to `test-acceptance`. Executed protocol-definition paths
+are dependencies; comments alone are not. Declared module gates and shared USB
+source dependencies retain carrier routing. Browser/native-only changes reach
+panel contract tests and docs; a real-browser run remains a separate local check.
+Test carriers stay excluded by default; `TESTS=1` includes them. Quick reach does
+not stand for the explicit carrier/model/speed matrix, which must run separately.
+
+Final-image assembly proof must include accepted UART equality, boot/live
+initialization, late attach, interrupted publication, lease expiry/reset,
+CRC/chunk faults, DMA/replacement-setup/abort, preserved descriptors/requests and
+existing audio/MIDI/input/alignment gates across standalone and supported audio
+selections. Deliberately bypass capture or dispatch to demonstrate that the
+instrument fails. Broader matrix evidence is still in progress; passing host
+models alone cannot certify assembly or a physical integration.
+
+The [design record](../firmware/USB_PANEL_MIRROR.md) distinguishes the initial
+port boot/EP0 results from hardware budgets. The [operator guide](../guide/USB_PANEL_MIRROR.md)
+records safe permissions and recovery. No physical unit, driver trace, sustained
+audio workload, measured latency/headroom or flash is available in this record.
+Chromium 151/Linux browser acceptance used a fake HTTP source and covered two tabs
+and legacy controls; native AppKit runtime remains unmeasured. Never download
+private OS/project fixtures or upload firmware-bearing `out/` artifacts in CI.
