@@ -48,6 +48,14 @@ not unit identity. Ctrl-C cancels the worker and closes the server. Five polls
 per second is the default, not evidence of ten visible updates per second.
 Physical latency/audio headroom and Windows driver coexistence are unmeasured.
 
+The encoded-EP0 integration test uses the real SnapshotClient, HardwareBackend
+and HTTP handler, including shared HTTP/SSE viewers and reconnect recovery.
+Chromium 151/Linux with Node 24 checks the source-aware browser against a fake
+HTTP source. Production-server smoke also boots stock and the MAIN mirror image
+and checks the borrowed main call's live gain result and AMP attack keys/knob
+through the real port, with no project and sound off. These checks
+do not establish physical USB access, AppKit runtime or project/audio soak proof.
+
 Hardware serves only `/`, `/skin.js`, `/screen.png`, `/screen.txt`, `/status`,
 `/map`, `/leds`, and `/leds/stream`. Before a validated frame the screen routes
 return `503 frame_unavailable`; unavailable LED state returns

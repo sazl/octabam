@@ -18,8 +18,10 @@ Viewing does not build or flash firmware and needs no local OS image or project.
 Protocol/transport tests use synthetic data. Boot capture and the initial EP0
 probe have ColdFire port evidence; they do not establish physical USB driver
 access, simultaneous audio, hardware timing or performance. There is no physical
-unit or flash evidence from this implementation. Broader final-image validation
-is still in progress. See the [design and proof limits](../firmware/USB_PANEL_MIRROR.md).
+unit or flash evidence from this implementation. Final port validation passed
+80 audio-profile runs, four standalone runs and three negative controls with
+the scoped digital checks described in the
+[design and proof limits](../firmware/USB_PANEL_MIRROR.md).
 
 ## Install host dependencies
 
@@ -112,7 +114,9 @@ project/card operations, uploads, audio controls and captures are unavailable.
 `watch` requires a count or duration. Run one probe at a time, with the viewer
 stopped. These commands do not write device state beyond mirror lease bookkeeping.
 Keep captures under ignored `out/`; do not publish proprietary firmware or device
-captures as CI fixtures. Browser acceptance so far used Chromium 151 on Linux
-with a fake HTTP source, including two tabs and legacy emulator controls. Native
+captures as CI fixtures. Browser acceptance used Chromium 151 on Linux with
+Node 24 and a fake HTTP source, including two tabs and legacy emulator controls.
+Encoded mirror exchanges also passed through the real SnapshotClient,
+HardwareBackend and HTTP handler; these are host integration checks. Native
 AppKit compilation/runtime and physical Linux/macOS/Windows acceptance remain
 unmeasured.

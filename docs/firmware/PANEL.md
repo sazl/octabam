@@ -4,7 +4,9 @@ The experimental [USB panel mirror](USB_PANEL_MIRROR.md) observes accepted
 outgoing panel bytes rather than a guessed framebuffer. Its boot capture found
 traffic before the DRAM loader: an initialized ROM FIFO guards both accepted
 ring commits, then drains in order after the loader before live observation.
-MKI/MKII port boot streams match the wire oracle with full 128-block LCD coverage;
+The FIFO holds 3072 bytes; both models accepted 2522 early bytes. Separate
+MKI/MKII captured runtime UART vectors are byte-identical with capture enabled
+or disabled (6919/8156 bytes), with full 128-block LCD coverage;
 this does not establish physical timing or audio coexistence. The historical
 measurements below remain their original evidence.
 

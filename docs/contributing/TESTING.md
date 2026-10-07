@@ -632,13 +632,36 @@ initialization, late attach, interrupted publication, lease expiry/reset,
 CRC/chunk faults, DMA/replacement-setup/abort, preserved descriptors/requests and
 existing audio/MIDI/input/alignment gates across standalone and supported audio
 selections. Deliberately bypass capture or dispatch to demonstrate that the
-instrument fails. Broader matrix evidence is still in progress; passing host
-models alone cannot certify assembly or a physical integration.
+instrument fails. The reviewed final verifier passed all 80 registry matrix
+runs (20 output/input selections × MKI/MKII × HS/FS), four standalone runs and
+three private capture/dispatch/publisher negative controls. These runs establish
+modeled digital behavior, not a physical integration. The 240 audio windows
+retain raw counters: FS short-build counts 0–444 use source/cadence/conservation
+bounds; 30 HS input selections show underrun deltas 0–2 and only claim input
+progress/bad-partial checks. DSP destination routing is the separate gate below.
+Final combined-root gates remain pending; earlier host-suite totals describe
+their own branch checkpoints.
+
+Independent existing gates cover 20 output selections through an image-validated
+private park wrapper, 15 native input selections and five input-absent N/A cases
+at the reviewed core checkpoint. MKI output checks use HS/FS; active DSP/recorder
+input checks use HS only. The reviewed permanent launch helper subsequently
+passed canonical unwrapped output and input gates on the same MAIN+ABCD image
+and runtime ELF. Keep these coverage distinctions: the existing output tag
+oracle ignores unrecognized words, and none of these passes establish all-sample
+purity, concurrent snapshot/input traffic or MAIN/CUE alignment. `OT_PROJECT`
+is absent here; `verify_usb_align` honestly reports SKIP, which blocks strict
+release acceptance. Supply an authorized source project and rerun that gate
+before claiming project alignment.
 
 The [design record](../firmware/USB_PANEL_MIRROR.md) distinguishes the initial
 port boot/EP0 results from hardware budgets. The [operator guide](../guide/USB_PANEL_MIRROR.md)
 records safe permissions and recovery. No physical unit, driver trace, sustained
 audio workload, measured latency/headroom or flash is available in this record.
 Chromium 151/Linux browser acceptance used a fake HTTP source and covered two tabs
-and legacy controls; native AppKit runtime remains unmeasured. Never download
+and legacy controls under Node 24. Encoded EP0 E2E uses the real SnapshotClient,
+HardwareBackend and HTTP handler; separate production server smoke boots stock
+and the MAIN mirror image, checks the borrowed main call's live gain result and
+exercises AMP attack keys/knob, with no project and sound off. Native
+AppKit runtime remains unmeasured. Never download
 private OS/project fixtures or upload firmware-bearing `out/` artifacts in CI.

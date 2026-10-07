@@ -826,6 +826,9 @@ never detour early ring commits directly into unloaded DRAM. Use the initialized
 ROM guard/FIFO and fail closed on overflow or a bypassed wire path. The publisher
 copies and computes CRC outside USB/audio IRQs; EP0 must never wait for a full
 snapshot. State must be explicitly initialized, and DMA replies must be private,
-aligned and uncached. Host access must not configure/reset/claim/detach the audio
+aligned and uncached. A replacement SETUP is not a DMA-completion guarantee;
+flush and check EP0 IN before reusing its reply. The 10 Hz limit bounds successful
+publications, not raced copy attempts or CPU cost. Port instruction counts do
+not prove microseconds. Host access must not configure/reset/claim/detach the audio
 interfaces. [USB_PANEL_MIRROR.md](docs/firmware/USB_PANEL_MIRROR.md) records the ABI,
 corrected boot boundary and the limits of port proof.

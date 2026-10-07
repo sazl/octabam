@@ -3,6 +3,14 @@
 The unit as a USB audio input (UAC2, 44.1 kHz, 24-bit), twenty channels.
 Needs USB MIDI: the audio function is added to its composite device.
 
+The shared output dispatcher conditionally supports
+[USB PANEL MIRROR](../usb-panel-mirror/README.md) when selected. Mirror requests
+`0x57`–`0x5a` preserve counter requests `0x55`/`0x56`; the mirror's standalone
+adapter is exclusive with audio outputs. See the
+[mirror evidence record](../../docs/firmware/USB_PANEL_MIRROR.md) for its
+coexistence coverage and open physical requirements. The historical audio
+measurements below retain their original scope.
+
 | USB speed | channels | content |
 |---|---|---|
 | high | 1–16 | track N's L/R on 2N−1/2N, post-FX, pre-fader |
