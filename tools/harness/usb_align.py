@@ -39,6 +39,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import toolpath  # noqa: E402,F401
+from port_image import launch_args  # noqa: E402
 from remix import registry  # noqa: E402
 
 EMU = ROOT / "out/emu/ot_emu"
@@ -129,7 +130,7 @@ def main():
     ring_b = 1024 * FRAME_B
     log = OUT / "port.txt"
     with open(log, "w") as lf:
-        r = subprocess.run([str(EMU), "--image", str(image), "--card", str(card), "--set", "OCTABAM",
+        r = subprocess.run(launch_args([str(EMU), "--image", str(image), "--card", str(card), "--set", "OCTABAM",
                             "--project", "USBSIG", "--sequencer", "--internal-clock", "--poke-trig", "2",
                             "--frames", str(a.frames), "--load-ms", "90000",
                             # the producer runs only while a host asks for the stream (5 Oct 2026);
@@ -139,7 +140,7 @@ def main():
                             "--poke", f"{sym['aud_force']:#x}=1",
                             "--dsp", "--main-level", "64",          # both cores live; MAIN volume up (verify_set's run)
                             "--mem-dump", f"{sym['aud_ring']:#x},{ring_b}={OUT / 'ring.bin'};"
-                                          f"{sym['aud_produced']:#x},4={OUT / 'produced.bin'}"],
+                                          f"{sym['aud_produced']:#x},4={OUT / 'produced.bin'}"]),
                            cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT)
     if r.returncode:
         sys.exit(f"usb_align: ot_emu exit {r.returncode} -- {log}")

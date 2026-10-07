@@ -22,6 +22,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401  (every tools/ dir on sys.path)
+from port_image import launch_args  # noqa: E402
 from remix import platform_build, registry  # noqa: E402
 
 EMU = ROOT / "out/emu/ot_emu"
@@ -64,7 +65,7 @@ if dram:
 args = [str(EMU), "--image", str(IMAGE), "--max", "80000000",
         "--watch-pc", f"0x{entry:x},0x{fatal:x}",
         "--mem-dump", ";".join(f"0x{a:x},{n}={p}" for a, n, p in dumps)]
-r = subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
+r = subprocess.run(launch_args(args), capture_output=True, text=True, cwd=ROOT)
 out = r.stdout
 handoff = "HANDOFF" in out
 hits = [l for l in out.splitlines() if l.strip().startswith("[") and " at 0x" in l]

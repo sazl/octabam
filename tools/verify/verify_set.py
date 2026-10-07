@@ -46,6 +46,7 @@ panel (edits arrive by --call), cross-core timing, the cycle wall.
 import argparse, math, os, pathlib, re, shutil, subprocess, sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401  (every tools/ dir on sys.path)
+from port_image import launch_args  # noqa: E402
 from remix import registry, stock  # noqa: E402
 import ot_project as otp  # noqa: E402
 
@@ -295,6 +296,7 @@ def main():
                "--dsp-peek", "0:Y:36082,1;1:Y:36082,1;1:X:6229,1;1:X:6275,1;0:Y:36081,1;0:Y:9f4,1"] \
             + (["--poke-trig", str(a.poke_trig)] if a.poke_trig else []) \
             + (["--midi-out", str(midi_out)] if midi_out else []) + a.extra.split()
+        cmd = launch_args(cmd)
         if a.stage_only:
             log.write_text(" ".join(cmd) + "\n")
             print(f"verify_set: staged {image.name} and {card.name} for bank {bank} part {part_no}, nothing run -- {OUT}")

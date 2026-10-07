@@ -41,6 +41,7 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401
+from port_image import launch_args  # noqa: E402
 import usb_host  # noqa: E402  (tools/harness)
 from remix import registry  # noqa: E402
 from verify_usb import LAYOUTS  # noqa: E402  (the input layouts: channels, packet cap, bInterval, taps)
@@ -122,9 +123,9 @@ def run(tag, sym, packets, close_first, in_frame, reset=False, unplug=False):
            f"{sym['in_alt']:#x},1={dump}/in_alt.bin;{sym['in_running']:#x},1={dump}/in_running.bin;"
            f"{sym['usbaudio_alt']:#x},1={dump}/aud_alt.bin;{sym['aud_running']:#x},1={dump}/aud_running.bin")
     with open(log, "w") as lf:
-        emu = subprocess.Popen([str(EMU), "--image", str(IMAGE), "--usb-host", sock,
+        emu = subprocess.Popen(launch_args([str(EMU), "--image", str(IMAGE), "--usb-host", sock,
                                 "--usb-hold-ms", "300000", "--frame", "--dsp",
-                                "--dsp-peek", peek, "--mem-dump", mem],
+                                "--dsp-peek", peek, "--mem-dump", mem]),
                                cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT)
     try:
         b = usb_host.Bench(sock, timeout=120.0)

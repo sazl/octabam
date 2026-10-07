@@ -28,6 +28,7 @@ import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401
+from port_image import launch_args  # noqa: E402
 import usb_host  # noqa: E402  (tools/harness)
 
 from remix import registry  # noqa: E402
@@ -52,7 +53,7 @@ def main():
         print("  [SKIP] verify_usbmidi_clock: the remix has no USB MIDI")
         return 0
     sock = f"/tmp/ot-usbclk-{os.getpid()}.sock"     # sun_path is 104 bytes on macOS
-    emu = subprocess.Popen([str(EMU), "--image", str(IMAGE), "--interactive", "--usb-host", sock, "--main-level", "off"],
+    emu = subprocess.Popen(launch_args([str(EMU), "--image", str(IMAGE), "--interactive", "--usb-host", sock, "--main-level", "off"]),
                            cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     fails = []
 

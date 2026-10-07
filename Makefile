@@ -165,7 +165,7 @@ emu-cf: ## Build and run the headless ColdFire machine (tools/emu/ot_emu) -- boo
 	cmake --fresh -B out/emu -S tools/emu/ot_emu -DCMAKE_OSX_ARCHITECTURES=$(HOST_ARCH) >/dev/null
 	cmake --build out/emu -j8 >/dev/null
 	$(PY) tools/verify/reach.py --stamp-port
-	./out/emu/ot_emu --image $(if $(IMAGE),$(IMAGE),out/raw/section_3_MAIN_OS.bin)
+	python3 tools/harness/port_image.py ./out/emu/ot_emu --image $(if $(IMAGE),$(IMAGE),out/raw/section_3_MAIN_OS.bin)
 
 .PHONY: verify-onebus
 verify-onebus: ## THE ONE AUX BUS on both cores: chain, each host's print, WET passthrough, T8 refusal, no station sends (~2 min)
