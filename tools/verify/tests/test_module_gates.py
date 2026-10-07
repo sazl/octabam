@@ -6,6 +6,9 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
+import contextlib
+import io
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import module_gates  # noqa: E402
@@ -18,6 +21,25 @@ def module(key, *gates):
 
 
 class OnceGates(unittest.TestCase):
+    def test_image_gate_runs_with_exact_remix_and_build(self):
+        gate = Gate("tools/verify/verify_usb_panel.py", stage="image")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / gate.script).parent.mkdir(parents=True)
+            (root / gate.script).write_text(
+                'import os, sys\n'
+                'assert sys.argv[1] == "selected-carrier"\n'
+                'assert os.environ["REMIX"] == "selected-carrier"\n'
+                'assert os.environ["BUILD"] == "panel79"\n')
+            selected = types.SimpleNamespace(name="selected-carrier")
+            command = module_gates.command
+            with patch.object(module_gates, "ROOT", root), \
+                    patch.object(module_gates, "command", side_effect=lambda g, n: command(g, n, root=root)), \
+                    patch.object(module_gates.registry, "remix", return_value=selected), \
+                    patch.object(module_gates.registry, "selected", return_value=[module("USB PANEL MIRROR", gate)]), \
+                    patch.dict(os.environ, {"BUILD": "panel79"}), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(module_gates.main([selected.name, "--stage", "image"]), 0)
+
     def test_once_needs_remix_arg_and_the_isolated_stage(self):
         Gate("tools/verify/x.py", once=True)
         with self.assertRaises(ValueError):

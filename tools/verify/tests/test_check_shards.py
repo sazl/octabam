@@ -2,6 +2,7 @@
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))
@@ -48,6 +49,14 @@ class ByGate(unittest.TestCase):
     def test_every_job_carries_the_remix(self):
         for _n, _c, env, _s in self.jobs():
             self.assertEqual(env["REMIX"], "bottleservice")
+
+    def test_image_job_keeps_exact_selection_and_build(self):
+        with patch.dict("os.environ", {"BUILD": "usb-panel-test-79"}):
+            (_n, commands, env, scripts), = [j for j in self.jobs() if j[0] == "image"]
+        self.assertEqual(env, {"REMIX": "bottleservice", "BUILD": "usb-panel-test-79"})
+        self.assertEqual(commands[1][1:],
+                         ["tools/verify/module_gates.py", "bottleservice", "--stage", "image"])
+        self.assertIn("tools/verify/module_gates.py", scripts)
 
     def test_without_a_venv_the_skip_jobs_still_stand_for_their_scripts(self):
         real = check_shards.ROOT

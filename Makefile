@@ -144,6 +144,11 @@ panel: ## The virtual front panel: REMIX on the port with sound at localhost:856
 	$(PY) tools/panel/panel_server.py --image out/panel_$(REMIX).bin --project "$(OT_PROJECT)" \
 	  --card "$(PANEL_CARD)" --port $(PANEL_PORT) $(PANELARGS)
 
+.PHONY: panel-hardware
+panel-hardware: ## Read-only physical USB panel in a browser; no REMIX, firmware image, or project needed
+	$(PY) tools/panel/panel_server.py --source hardware --port $(PANEL_PORT) \
+	  $(if $(USB_DEVICE),--usb-device "$(USB_DEVICE)",) --usb-poll-hz $(or $(USB_POLL_HZ),5) $(ARGS)
+
 .PHONY: panel-app
 panel-app: ## Build the panel's macOS app (out/Virtual Panel.app; File > Open Firmware Image for a remix)
 	bash tools/panel/app/build.sh
@@ -379,8 +384,21 @@ verify-docs: ## The rendered tables are current and every link between tracked f
 	python3 tools/verify/verify_docs.py
 
 .PHONY: test-acceptance
-test-acceptance: ## Firmware-free tests of the acceptance runner and the reach classifier
+test-acceptance: ## Firmware-free acceptance runner, reach, and host panel/protocol tests
 	python3 -m unittest discover -s tools/verify/tests -p 'test_*.py' -v
+
+.PHONY: test-panel test-panel-pyusb verify-usb-panel
+test-panel: ## Firmware-free USB mirror protocol/transport and panel backend/route tests
+	$(PY) -m unittest discover -s tools/verify/tests -p 'test_usb_panel_*.py' -v
+	$(PY) -m unittest discover -s tools/verify/tests -p 'test_panel_*.py' -v
+
+test-panel-pyusb: ## Firmware-free transport safety against real PyUSB 1.3.1 (install that optional library first)
+	$(PY) -c 'import importlib.metadata; assert importlib.metadata.version("pyusb") == "1.3.1", "needs PyUSB 1.3.1"'
+	$(PY) -m unittest discover -s tools/verify/tests -p 'test_usb_panel_transport.py' -v
+
+verify-usb-panel: ## Verify the selected restored final image's mirror; REMIX=<name>, BUILD=<matching image build>
+	$(need-remix)
+	REMIX="$(REMIX)" BUILD="$(BUILD)" $(PY) tools/verify/verify_usb_panel.py "$(REMIX)"
 
 BASE ?= origin/main
 

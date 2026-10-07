@@ -2,6 +2,7 @@
 no manifests, no firmware."""
 import pathlib
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -138,6 +139,17 @@ class ModuleAndRemixTests(unittest.TestCase):
 
 
 class DependencyTests(unittest.TestCase):
+    def test_usb_shared_source_and_image_gate_reach_selected_carriers(self):
+        c = ctx()
+        c.module_key["usb-panel-mirror"] = "USB PANEL MIRROR"
+        c.remixes_of["USB PANEL MIRROR"] = ["usb"]
+        c.gate_owners["tools/verify/verify_usb_panel.py"] = ["USB PANEL MIRROR"]
+        c.gate_shared["tools/verify/verify_usb_panel.py"] = False
+        c.deps["tools/verify/verify_usb_panel.py"] = {"tools/usb/usb_shared.s"}
+        for path in ("modules/usb-panel-mirror/panel_capture.s", "tools/usb/usb_shared.s",
+                     "tools/verify/verify_usb_panel.py"):
+            self.assertIn("make check REMIX=usb", commands([path], c=c), path)
+
     def test_the_build_and_what_it_imports_reach_refhash_identity_and_the_shared_half(self):
         for p in ("tools/build/build_bus.py", "tools/remix/schema.py", "tools/build/dsp_modmap.py", "dsp/probe.asm"):
             self.assertEqual(commands([p]), BUILD, p)
@@ -344,6 +356,41 @@ class PlanTests(unittest.TestCase):
 
 
 class GraphTests(unittest.TestCase):
+    def test_panel_imports_resolve_package_and_local_forms(self):
+        known = {"tools/panel/usb_mirror.py", "tools/panel/panel_backend.py"}
+        for module, names, expected in (
+                ("tools.panel", ["usb_mirror"], "tools/panel/usb_mirror.py"),
+                ("tools.panel.usb_mirror", [], "tools/panel/usb_mirror.py"),
+                ("panel_backend", ["FB"], "tools/panel/panel_backend.py")):
+            self.assertEqual(reach.resolve_import(module, names, known.__contains__), {expected})
+
+    def test_panel_host_dependency_chain_reaches_firmware_free_tests(self):
+        files = {
+            "tools/verify/tests/test_panel_routes.py": "from tools.panel import panel_server\n",
+            "tools/panel/panel_server.py": "import panel_hardware\nimport panel_check\n",
+            "tools/panel/panel_hardware.py": "from tools.panel import usb_mirror\n",
+            "tools/panel/usb_mirror.py": "from tools.panel import usb_mirror_protocol\n",
+            "tools/panel/usb_mirror_protocol.py": 'p = ROOT / "modules/usb-panel-mirror/protocol.json"\n',
+            "tools/panel/panel_check.py": "pass\n",
+            "modules/usb-panel-mirror/protocol.json": "{}\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name, source in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+            c = ctx()
+            c.deps = reach.scan_deps(root)
+            for path in files:
+                self.assertIn("make test-acceptance", commands([path], c=c), path)
+
+    def test_browser_and_native_changes_reach_panel_contract_and_docs(self):
+        for path in ("tools/panel/panel.html", "tools/panel/skin/gen_svg.py",
+                     "tools/panel/app/VirtualPanel.swift", "tools/panel/app/build.sh"):
+            self.assertEqual(commands([path]),
+                             ["python3 tools/verify/verify_docs.py", "make test-acceptance"], path)
+
     def test_path_refs_count_runs_and_reads_not_prose(self):
         src = '''
 """tools/harness/prose.py is named in this docstring."""
@@ -444,6 +491,15 @@ class TestRemixTests(unittest.TestCase):
         kinds = [k for _, g, _ in rows for k, _ in g]
         self.assertNotIn("check", kinds)
         self.assertNotIn("accept", kinds)
+
+    def test_including_test_carriers_reaches_their_image_checks(self):
+        c = ctx()
+        c.include_tests = True
+        c.test_remixes = {"miniverb"}
+        self.assertIn("make check REMIX=miniverb",
+                      commands(["modules/miniverb/engine.asm"], c=c))
+        self.assertIn("make check REMIX=miniverb",
+                      commands(["remixes/test/miniverb/remix.py"], c=c))
 
     def test_identity_names_only_the_remixes_in_play(self):
         c = self.ctx_without_tests()

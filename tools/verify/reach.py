@@ -129,9 +129,9 @@ CLASSIFIER = ("tools/verify/reach.py",)
 # several times slower: 28-29 Sep 2026.) FULL runs at nice 0.
 BACKGROUND = "nice -n 10" if shutil.which("nice") else ""
 # Makefile targets by what a change to them reaches.
-MAKE_CHECK = {"bus", "cycles", "verify", "verify-shared", "verify-remix", "check", "check-shared", "check-remix",
+MAKE_CHECK = {"bus", "cycles", "verify", "verify-shared", "verify-remix", "verify-usb-panel", "check", "check-shared", "check-remix",
               "need-remix", "os", "recon"}
-MAKE_RUNNER = {"accept", "test-acceptance", "reach", "check-remixes"}
+MAKE_RUNNER = {"accept", "test-acceptance", "test-panel", "test-panel-pyusb", "reach", "check-remixes"}
 MAKE_CI = {"ci", "ci-dsp", "ci-emu", "emu-cf", "check-asm"}
 
 
@@ -178,7 +178,7 @@ CMD = {
 # ---- the dependency graph over tools/ ------------------------------------
 
 IMPORT = re.compile(r"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import\s+([\w, ]+)|import\s+([A-Za-z_][\w.]*))", re.M)
-PATHREF = re.compile(r"\b((?:tools|scripts|dsp)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)\b")
+PATHREF = re.compile(r"\b((?:tools|scripts|dsp|modules)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)\b")
 # A path string is a dependency when the code RUNS or READS it: an argument
 # of one of these calls (an argv list inside subprocess.run counts), or a
 # `ROOT / "tools/x/y.py"`. A path in a comment, a docstring, a message or a
@@ -223,16 +223,18 @@ def resolve_import(module, names, exists):
     `remix` package under tools/, every group directory by bare name."""
     out = set()
     parts = module.split(".")
+    if parts[0] == "tools":
+        parts = parts[1:]
     base = "tools/" + "/".join(parts)
     if exists(base + ".py"):
         out.add(base + ".py")
     if exists(base + "/__init__.py"):
         out.add(base + "/__init__.py")
-    for n in names:                     # `from hw import ot_bank`: tools/hw has no __init__
+    for n in names:                     # tools/ group namespace packages have no __init__
         if exists(f"{base}/{n}.py"):
             out.add(f"{base}/{n}.py")
     if len(parts) == 1:
-        for g in ("build", "harness", "emu", "hw", "verify"):
+        for g in ("build", "harness", "emu", "hw", "verify", "panel"):
             if exists(f"tools/{g}/{module}.py"):
                 out.add(f"tools/{g}/{module}.py")
     return out
@@ -482,6 +484,8 @@ def route_tool(path, ctx):
         return ctx.build_change(), f"the build: refhash the flag matrix, identity the remixes whose image moved (their checks follow), the shared half once for {ctx.floor_note()}"
     if path in CLASSIFIER or path.startswith("tools/verify/tests/"):
         return [CMD["test-acceptance"]], "the classifier and its tests: their own tests are the gate"
+    if path == "tools/panel/panel.html" or path.startswith(("tools/panel/skin/", "tools/panel/app/")):
+        return [CMD["test-acceptance"], CMD["verify_docs"]], "panel frontend contract tests and docs; real-browser acceptance remains local"
     if path in ACCEPTANCE:
         return [CMD["test-acceptance"]] + ctx.every() + [cmd_accept(r) for r in ctx.floor], f"the acceptance machinery: {ctx.floor_note()}"
     if path.startswith("tools/emu/ot_emu/"):
@@ -492,6 +496,9 @@ def route_tool(path, ctx):
         return [CMD["refhash"]], ""
     users = ctx.dependents(path) | {path}
     gates, notes = [], []
+    if any(u.startswith("tools/verify/tests/") for u in users):
+        gates.append(CMD["test-acceptance"])
+        notes.append("firmware-free tests depend on it")
     if users & set(BUILD_ROOTS):
         return ctx.build_change(), f"the build depends on it: refhash, identity (the remixes whose image moved are checked), the shared half once for {ctx.floor_note()}"
     if users & set(ACCEPTANCE):
@@ -670,6 +677,9 @@ def classify(paths, ctx):
             else:
                 note = "unknown module directory"
                 gates = ctx.every()
+            if any(u.startswith("tools/verify/tests/") for u in ctx.dependents(path)):
+                gates.append(CMD["test-acceptance"])
+                note += "; firmware-free tests depend on it"
         elif top == "remixes" and len(parts) >= 2:
             # remixes/<name>/..., remixes/test/<name>/..., or a flat remixes/<name>.py
             name = parts[2] if parts[1] == "test" and len(parts) >= 3 else parts[1]
