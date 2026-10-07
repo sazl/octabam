@@ -322,10 +322,7 @@ class PortImageAssociation(unittest.TestCase):
         self.fixture = PortImage()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        runtime = self.fixture.root / 'out/platform/runtime/runtime.elf'
-        runtime.parent.mkdir(parents=True)
-        runtime.write_bytes(self.fixture.runtime.read_bytes())
-        (runtime.parent.parent / 'loader.elf').write_bytes((self.fixture.root / 'loader.elf').read_bytes())
+        self.fixture.install_default_metadata()
         root = patch.object(port_image, 'ROOT', self.fixture.root)
         root.start(); self.addCleanup(root.stop)
     def selected_panel(self, arguments=()):
@@ -347,11 +344,31 @@ class PortImageAssociation(unittest.TestCase):
                           ['--image=' + str(self.fixture.image)]):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 self.selected_panel(arguments)._port_argv()
-    def test_image_loader_mismatch_refuses_launch(self):
+    def test_unrelated_default_loader_preserves_argv_without_inferred_park(self):
+        expected = self.selected_panel()._port_argv()[:-2]
         image = bytearray(self.fixture.image.read_bytes()); image[-1] ^= 1
         self.fixture.image.write_bytes(image)
-        with self.assertRaisesRegex(ValueError,'loader.*image'):
-            self.selected_panel()._port_argv()
+        for arguments in ([], ['--main-park', self.pair()]):
+            with self.subTest(arguments=arguments):
+                argv = self.selected_panel(arguments)._port_argv()
+                self.assertEqual(argv, expected[:-1] + arguments + expected[-1:])
+    def test_missing_default_metadata_preserves_unknown_dram_launch(self):
+        expected = self.selected_panel()._port_argv()[:-2]
+        (self.fixture.root / 'out/platform/loader.elf').unlink()
+        self.assertEqual(self.selected_panel()._port_argv(), expected)
+    def test_known_mirror_corrupt_branch_and_conflict_prevent_child_creation(self):
+        def rejected(arguments, error):
+            panel = self.selected_panel(arguments)
+            panel.stop_event = threading.Event()
+            with patch.object(ps, 'PortProc', side_effect=AssertionError('child spawned despite known mirror defect')):
+                with self.assertRaisesRegex(ValueError, error):
+                    panel._boot_port()
+        rejected(['--main-park', '0x47000012:0x47000000'], 'conflict')
+        park = self.fixture.symbols['mirror_idle_park'] - self.fixture.base
+        self.fixture.raw = self.fixture.raw[:park] + bytes.fromhex('4e71') + self.fixture.raw[park + 2:]
+        self.fixture.write_fixture()
+        self.fixture.install_default_metadata()
+        rejected([], 'branch')
     def test_stock_image_keeps_existing_arguments_without_elf_metadata(self):
         image = bytearray(self.fixture.image.read_bytes())
         image[0x1f896:0x1f89c] = bytes.fromhex('4eb940098a2c')
