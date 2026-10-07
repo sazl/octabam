@@ -1283,9 +1283,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         Log.write("reload")
         server.probe(timeout: 1.0) { [weak self] ok, status in
             guard let self = self, self.emulatorAllowed(ok ? status : nil) else { return }
-            if ok { self.loadPanel() }
-            else if self.server.running { self.startPolling() }
-            else { self.startServer() }
+            if self.server.running {
+                if ok, self.panelShown { self.web.reload() }
+                else { self.startPolling() }
+            } else {
+                // Foreign emulators retain startServer's stale-code retirement
+                // and attachment bookkeeping, after source verification.
+                self.startServer()
+            }
         }
     }
 
@@ -1794,7 +1799,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             panel.directoryURL = URL(fileURLWithPath: d, isDirectory: true)
         }
         panel.beginSheetModal(for: window) { [weak self] resp in
-            guard let self = self, !self.quitting else { return }
+            guard let self = self, !self.quitting, self.emulatorAllowed() else { return }
             guard resp == .OK, let dest = panel.url else { Log.write("save (\(source)): cancelled"); return }
             UserDefaults.standard.set(dest.deletingLastPathComponent().path, forKey: Self.saveDirKey)
             self.download(url, to: dest, source: source)

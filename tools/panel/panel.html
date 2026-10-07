@@ -336,7 +336,7 @@ const STAGE_W = 1250, STAGE_H = 682;   // the skin's viewBox (tools/panel/skin/g
 
 // Source identity is authoritative; no controls or emulator polling before it.
 const PORT_CAPS = ["screen", "leds", "backlight", "controls", "midi", "memory", "emulator", "samples", "card", "audio"];
-let source = null, capabilities = new Set(), sourceReadOnly = true;
+let source = null, capabilities = new Set(), sourceReadOnly = true, hasVerifiedFrame = false;
 const can = cap => capabilities.has(cap) && (!sourceReadOnly || ["screen", "leds", "backlight"].includes(cap));
 const endpointCap = path => {
   if (["/", "/skin.js", "/status", "/map", "/screen.png", "/screen.txt"].includes(path)) return null;
@@ -362,13 +362,14 @@ function sourceStatus(s) {
   const readOnly = !port || s.read_only === true;
   const identified = port ? "port" : hardware ? "hardware" : null;
   const changed = source !== identified || before !== after || sourceReadOnly !== readOnly;
-  if (source !== identified) lastSeq = -1;
+  if (source !== identified) { lastSeq = -1; hasVerifiedFrame = false; }
   sourceReadOnly = readOnly; source = identified; capabilities = new Set(caps);
   if (changed || !can("controls")) cancelControls();
   if (!can("audio")) {
     clearTimeout(MON.statusTimer); clearTimeout(MON.armTimer);
     MON.open = false; if (MON.on) monStop();
     $("#mon").classList.remove("open");
+    monRender();
   }
   if (!can("samples") || !can("card")) {
     clearTimeout(armTimer); poolOpen = false;
@@ -1353,13 +1354,14 @@ async function refreshAudioStatus() {
   try { await audioStatus(); MON.statusErr = null; } catch (e) { MON.statusErr = e.message; }
   MON.statusBusy = false;
   monRender();
-  if (MON.open || MON.on) MON.statusTimer = setTimeout(refreshAudioStatus, 1000);
+  if (can("audio") && (MON.open || MON.on)) MON.statusTimer = setTimeout(refreshAudioStatus, 1000);
 }
 // SOUND ON/OFF: two clicks like RE-INSERT CARD (the first arms for 5 s); the
 // server reboots the port child with/without --dsp (~1 min / ~40 s), /status
 // phase shows it and the controls stay disabled meanwhile
 function soundLabel() {
   const b = $("#soundbtn");
+  if (!can("audio")) { b.title = ""; return; }
   if (!b.classList.contains("armed")) b.textContent = MON.sound === false ? "SOUND ON" : "SOUND OFF";
   b.title = MON.sound === false ? "reboot the unit with the DSP cores (~1 min): sound, and a sequencer ~9x slower than real time while it plays (~3x slower than without the cores)"
                                 : "reboot the unit without the DSP cores (~40 s): no sound, a faster sequencer";
@@ -1392,8 +1394,15 @@ function monPhase(s, phase) {
   if (changed) monRender();
 }
 function monRender() {
+  const hp = $("#hp"), sound = $("#soundbtn");
+  // An emulator response can finish after capabilities were revoked.
+  // Rendering must honor the current source as well as request/event guards.
+  if (!can("audio")) {
+    hp.classList.remove("plugged"); hp.title = "";
+    sound.disabled = true; sound.title = "";
+    return;
+  }
   const busy = monBusy();
-  const hp = $("#hp");
   hp.classList.toggle("plugged", MON.on);
   hp.title = "HEAD-PHONES — click: " + (MON.on ? `unplug (${monReadout()})` : "plug in and listen to the unit's main out (VOLUME is the gain; takes are recorded by the server, PLAY to STOP, and saved from the app's Audio menu)");
   const st = $("#monstate");
@@ -1518,6 +1527,7 @@ async function poll() {
     $("#note span").textContent = busy ? `loading — ${phase}` : "";
     if (can("samples") && can("card")) poolPhase(phase, s);
     if (can("audio")) monPhase(s, phase);
+    if (can("screen") && s.seq != null) hasVerifiedFrame = true;
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
     if (can("leds") && Object.keys(mapLeds).length && !ledStreamOn) applyLeds(await panelFetch("/leds").then(x => x.json()));
     // the crossfader: the firmware's value, on the first ready poll and every ~3.5 s after
@@ -1526,7 +1536,7 @@ async function poll() {
     // Transport failure revokes controls; preserve the last verified display.
     sourceStatus({source, read_only:true, capabilities:[]});
     $("#phase").textContent = "server unreachable"; $("#phase").className = "failed";
-    $("#note").classList.add("show"); $("#note span").textContent = "server unreachable — last verified frame";
+    $("#note").classList.add("show"); $("#note span").textContent = hasVerifiedFrame ? "server unreachable — last verified frame" : "server unreachable — waiting for a verified frame";
     document.body.classList.add("readonly");
     for (const selector of ["#card", "#hp", "#monbtn", ".knob.pot"]) $(selector).title = "";
     $("#monbtn").disabled = true;
@@ -1552,6 +1562,7 @@ function renderPhysicalStatus(s) {
   const time = t => t == null ? "unknown" : new Date(typeof t === "number" ? t * 1000 : t).toLocaleTimeString();
   hint(`contact ${time(s.last_contact_at)} · snapshot ${time(s.last_snapshot_at)} · display change ${time(s.last_display_change_at)}`);
   if (frame && can("screen")) {
+    hasVerifiedFrame = true;
     const seq = s.generation == null ? s.seq : s.generation;
     if (seq !== lastSeq) { lastSeq = seq; $("#screen").src = "/screen.png?" + seq; }
   }

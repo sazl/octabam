@@ -1,5 +1,5 @@
 // Optional real-browser instrument: Node's built-in WebSocket, no npm packages.
-const endpoint = process.argv[2], base = process.argv[3];
+const endpoint = process.argv[2], base = process.argv[3], mode = process.argv[4] || "capabilities";
 const ws = new WebSocket(endpoint);
 await new Promise(resolve => ws.addEventListener('open', resolve, {once: true}));
 let id = 0;
@@ -46,8 +46,36 @@ const events = `(() => {
 })()`;
 try {
   await call('Page.enable');
+  if (mode === 'no-frame-failure') await fetch(`${base}/fixture?source=hardware&state=server_error&frame=0`);
   await call('Page.navigate', {url:base});
   await pause(800);
+  if (mode === 'no-frame-failure') {
+    const label = () => evaluate("document.querySelector('#note span').textContent");
+    assert((await label()).includes('waiting'), 'first status failure must wait for a verified frame');
+    await fixture('hardware','connecting',false);
+    await fixture('hardware','server_error',false);
+    assert((await label()).includes('waiting'), 'no-frame status followed by transport failure must keep waiting');
+    await fixture('hardware','live',true);
+    await fixture('hardware','server_error',true);
+    assert((await label()).includes('last verified'), 'transport failure after a frame must label the retained frame');
+    console.log('PASS: real Chromium first-status/no-frame failure and verified-frame preservation');
+  } else if (mode === 'delayed-audio') {
+    await fixture('legacy');
+    await fetch(`${base}/audio-gate?hold=1`);
+    await evaluate('window.pendingAudio = refreshAudioStatus(); true');
+    const deadline = Date.now() + 3000;
+    while (!(await (await fetch(`${base}/requests`)).json()).includes('/audio/status')) {
+      assert(Date.now() < deadline, 'emulator audio request must reach the delayed fake server');
+      await pause(20);
+    }
+    await fixture('hardware');
+    assert((await evaluate("document.querySelector('#hp').title")) === '', 'hardware transition clears HEAD-PHONES title');
+    await fetch(`${base}/audio-gate?hold=0`);
+    await evaluate('window.pendingAudio.then(() => true)');
+    assert((await evaluate("document.querySelector('#hp').title")) === '', 'delayed emulator audio response must not restore hardware HEAD-PHONES control title');
+    assert(await evaluate("document.querySelector('#soundbtn').disabled && !document.querySelector('#soundbtn').title"), 'delayed audio response keeps hardware SOUND disabled without a control title');
+    console.log('PASS: real Chromium delayed emulator audio response cannot restore hardware control tooltips');
+  } else {
   // CDP delivers browser input events in addition to DOM dispatch coverage.
   const point = await evaluate(`(() => { const r=document.querySelector('.k[data-id="yes"]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
   await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
@@ -110,4 +138,5 @@ try {
   requests = await (await fetch(`${base}/requests`)).json();
   assert(requests.every(p => allowed.has(p)), 'hardware reload must remain read only');
   console.log('PASS: Chromium DOM pointer/wheel/touch/keyboard/drop, primitive guards, modifier release, source transition, static live/disconnect/reconnect, emulator key/wheel/fader, two simultaneous hardware tabs/reload');
+  }
 } finally { ws.close(); }
