@@ -155,6 +155,15 @@ class HardwareTests(unittest.TestCase):
             self.h.HardwareBackend("unit-A", transport_factory=factory)
         self.assertEqual(factory.calls, [])
 
+    def test_constructor_rejects_unrepresentable_poll_periods_before_open(self):
+        for rate in (1e-20, 5e-324):
+            with self.subTest(rate=rate):
+                factory = Factory(RecordingTransport())
+                with self.assertRaises(ValueError):
+                    backend = self.h.HardwareBackend(poll_hz=rate, transport_factory=factory)
+                    self.backends.append(backend)
+                self.assertEqual(factory.calls, [])
+
     def test_clean_package_and_script_imports_use_canonical_transport_types(self):
         import subprocess
         code = '''
@@ -436,6 +445,55 @@ assert script_worker.ViewSnapshot is panel_backend.ViewSnapshot
                         backend.close()
                     self.assertEqual(backend.status()["connection_state"], "closed")
                     self.assertEqual(transport.closed_by, [factory.calls[0][2]])
+
+    def test_worker_completion_before_close_status_lock_cannot_report_incomplete(self):
+        backend, transport, factory = self.start()
+        view = self.live(backend)
+        allow_dispose = threading.Event()
+        join_expired = threading.Event()
+        real_close = transport.close
+        real_join = backend._worker.join
+        real_alive = backend._worker.is_alive
+        real_lock = backend._lock
+        caller = threading.get_ident()
+
+        def held_dispose():
+            allow_dispose.wait(1)
+            real_close()
+
+        def joined(timeout=None):
+            real_join(timeout)
+            self.assertTrue(real_alive(), "the controlled disposal must outlast the join")
+            join_expired.set()
+
+        case = self
+        class CompleteBeforeStatusLock:
+            triggered = False
+            def __enter__(self):
+                if threading.get_ident() == caller and join_expired.is_set() and not self.triggered:
+                    self.triggered = True
+                    # Force the legal interleaving: bounded join expired with
+                    # a live worker; disposal/final status finish before the
+                    # caller acquires the status-publication lock.
+                    allow_dispose.set()
+                    real_join(1)
+                    case.assertFalse(real_alive())
+                return real_lock.__enter__()
+            def __exit__(self, *args):
+                return real_lock.__exit__(*args)
+
+        backend._lock = CompleteBeforeStatusLock()
+        self.addCleanup(allow_dispose.set)
+        with patch.object(transport, "close", side_effect=held_dispose), \
+                patch.object(backend._worker, "join", side_effect=joined), \
+                patch.object(self.h, "CLOSE_TIMEOUT_S", 0.02):
+            backend.close()
+        self.assertTrue(join_expired.is_set())
+        self.assertFalse(real_alive())
+        self.assertEqual(transport.closed_by, [factory.calls[0][2]])
+        self.assertEqual(backend.status()["connection_state"], "closed")
+        self.assertIsNone(backend.status()["error"])
+        self.assertIs(backend.snapshot(), view)
 
     def test_status_is_detached_and_viewers_never_perform_io(self):
         backend, transport, _ = self.start()

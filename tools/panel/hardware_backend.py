@@ -4,6 +4,8 @@ INFO heartbeats count as contact even when a screen is static. Reads have a
 250 ms transfer timeout and SnapshotClient's at-most-two-second lease budget.
 Polling waits at least the requested period, firmware minimum, and advertised
 publication period. Contact is stale after max(2 seconds, three poll periods).
+Poll rates must also have a finite reciprocal no larger than threading.TIMEOUT_MAX;
+unrepresentable worker waits are rejected before startup or device access.
 Recovery backs off from 0.5 to 5 seconds; three corrupt/timed-out acquisitions
 dispose the handle and renegotiate. Diagnostics retain only the last 16 entries.
 close signals cancellation and waits at most three seconds. A transport which
@@ -48,10 +50,13 @@ class HardwareBackend:
             raise ValueError("poll_hz must be finite and positive") from error
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError("poll_hz must be finite and positive")
+        configured_period = 1 / rate
+        if not math.isfinite(configured_period) or configured_period > threading.TIMEOUT_MAX:
+            raise ValueError("poll_hz is too small: polling interval must not exceed threading.TIMEOUT_MAX seconds")
         self._selector = mirror.DeviceSelector.parse(selector)
         self._selector_text = selector
         self._factory = mirror.open_transport if transport_factory is None else transport_factory
-        self._configured_period = 1 / rate
+        self._configured_period = configured_period
         self._period = self._configured_period
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -73,6 +78,7 @@ class HardwareBackend:
         self._known_rows = ()
         self._known_ids = ()
         self._backlight_known = False
+        self._worker_finished = False
         self._worker = threading.Thread(target=self._run, name="panel-usb-mirror", daemon=True)
         self._worker.start()
 
@@ -301,6 +307,7 @@ class HardwareBackend:
                 if self._error and self._error[0] == "shutdown_incomplete":
                     self._diagnostics.append((time.time(), "shutdown_complete", "Worker finished after delayed in-flight I/O"))
                     self._error = None
+                self._worker_finished = True
 
     def close(self) -> None:
         self._stop.set()
@@ -308,7 +315,7 @@ class HardwareBackend:
             self._state = "closed"
         if threading.current_thread() is not self._worker:
             self._worker.join(CLOSE_TIMEOUT_S)
-        if self._worker.is_alive():
-            with self._lock:
+        with self._lock:
+            if not self._worker_finished:
                 self._error = ("shutdown_incomplete", "Worker still has in-flight I/O; its handle will close when I/O ends")
                 self._diagnostics.append((time.time(), *self._error))
