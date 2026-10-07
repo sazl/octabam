@@ -22,6 +22,8 @@
   #bar button.icon.on { color:#ffd23a; }
   #bar .brand { color:#6f6d68; letter-spacing:.25em; font-size:10px; font-weight:600; }
   #bar .img { color:#bdbab2; font-family:ui-monospace, Menlo, monospace; font-size:10px; }
+  body.readonly .k, body.readonly .knob, body.readonly #fbed, body.readonly #fhandle, body.readonly #card, body.readonly #hp { cursor:default; }
+  #source { color:#f0c85a; font-size:10px; }
   #phase { padding:1px 8px; border-radius:9px; font-size:10px; background:#2a2a2c; color:#bdbab2; }
   #phase.ready { background:#1d3a22; color:#8fe39a; }
   #phase.busy { background:#3a3016; color:#f0c85a; }
@@ -275,6 +277,7 @@
   <div id="bar">
     <span class="brand">VIRTUAL PANEL</span>
     <span class="img" id="imginfo"></span>
+    <span id="source">IDENTIFYING SOURCE</span>
     <span id="phase">…</span>
     <span id="rt" title="x real time: emulated ms per wall s over the last second / 1000 (the unit's own clock = 1.00x)"></span>
     <span id="fault"></span>
@@ -330,6 +333,73 @@
 const $ = s => document.querySelector(s);
 const S = $("#stage");
 const STAGE_W = 1250, STAGE_H = 682;   // the skin's viewBox (tools/panel/skin/gen_svg.py)
+
+// Source identity is authoritative; no controls or emulator polling before it.
+const PORT_CAPS = ["screen", "leds", "backlight", "controls", "midi", "memory", "emulator", "samples", "card", "audio"];
+let source = null, capabilities = new Set(), sourceReadOnly = true;
+const can = cap => capabilities.has(cap) && (!sourceReadOnly || ["screen", "leds", "backlight"].includes(cap));
+const endpointCap = path => {
+  if (["/", "/skin.js", "/status", "/map", "/screen.png", "/screen.txt"].includes(path)) return null;
+  if (path === "/leds" || path === "/leds/stream") return "leds";
+  if (path.startsWith("/audio")) return "audio";
+  if (path.startsWith("/samples")) return "samples";
+  if (path.startsWith("/card")) return "card";
+  return "controls";
+};
+function panelFetch(url, options) {
+  const path = new URL(url, location.href).pathname, cap = endpointCap(path);
+  if (cap && !can(cap)) return Promise.resolve(new Response(JSON.stringify({ok:false, error:"capability_unavailable"}), {status:409, headers:{"Content-Type":"application/json"}}));
+  return fetch(url, options);
+}
+function sourceStatus(s) {
+  const next = Object.prototype.hasOwnProperty.call(s, "source") ? s.source : (s.backend === "port" ? "port" : null);
+  const backendPresent = Object.prototype.hasOwnProperty.call(s, "backend");
+  const port = next === "port" && (!backendPresent || s.backend === "port");
+  const hardware = next === "hardware" && (!backendPresent || s.backend === "hardware");
+  const caps = port ? (Array.isArray(s.capabilities) ? s.capabilities : PORT_CAPS)
+    : hardware ? (Array.isArray(s.capabilities) ? s.capabilities : []).filter(c => ["screen", "leds", "backlight"].includes(c)) : [];
+  const before = [...capabilities].sort().join(","), after = [...caps].sort().join(",");
+  const readOnly = !port || s.read_only === true;
+  const identified = port ? "port" : hardware ? "hardware" : null;
+  const changed = source !== identified || before !== after || sourceReadOnly !== readOnly;
+  if (source !== identified) lastSeq = -1;
+  sourceReadOnly = readOnly; source = identified; capabilities = new Set(caps);
+  if (changed || !can("controls")) cancelControls();
+  if (!can("audio")) {
+    clearTimeout(MON.statusTimer); clearTimeout(MON.armTimer);
+    MON.open = false; if (MON.on) monStop();
+    $("#mon").classList.remove("open");
+  }
+  if (!can("samples") || !can("card")) {
+    clearTimeout(armTimer); poolOpen = false;
+    $("#pool").classList.remove("open"); $("#card").classList.remove("open");
+  }
+  document.body.classList.toggle("readonly", !can("controls"));
+  $("#source").textContent = hardware ? "PHYSICAL · READ ONLY" : port ? "EMULATOR" : "UNKNOWN SOURCE · READ ONLY";
+  $("#monbtn").disabled = !can("audio");
+  for (const id of ["addbtn", "addinput", "reinsert"]) $("#" + id).disabled = !can("samples") || !can("card");
+  if (changed) {
+    refreshMapped(); drawFader();
+    for (const selector of ["#card", "#hp", "#monbtn", ".knob.pot"]) {
+      const el = $(selector);
+      if (!el.dataset.controlTitle) el.dataset.controlTitle = el.title;
+      el.title = can("controls") ? el.dataset.controlTitle : "";
+    }
+  }
+  if (can("leds")) { if (!ledStream) startLedStream(); }
+  else { clearTimeout(ledRetry); if (ledStream) ledStream.close(); ledStream = null; ledStreamOn = false; applyLeds({}); }
+}
+function cancelControls() {
+  for (const p of pending.values()) clearTimeout(p.timer);
+  pending.clear(); wheelAcc.clear();
+  clearTimeout(FADER.timer); FADER.timer = 0; FADER.want = null; FADER.drag = FADER.focus = false;
+  FHANDLE.classList.remove("focus"); drag = potDrag = null;
+  shiftHeld = aHeld = zHeld = false;
+  document.querySelectorAll(".k.held,.k.down").forEach(el => {
+    el.classList.remove("held", "down"); delete el.dataset.z; delete el.dataset.chord;
+  });
+}
+
 
 // ---------------- build: the MKII skin ----------------
 // The face is octemu's generated MKII panel (tools/panel/skin/gen_svg.py,
@@ -442,7 +512,7 @@ function drawBar() {
   document.body.classList.toggle("nobar", !barShown);
   const b = $("#topbtn");
   b.textContent = barShown ? "\u25b2" : "\u25bc";
-  b.title = barShown ? "hide the top bar (the panel takes the whole window)" : "show the top bar (status, SOUND, the drawers)";
+  b.title = barShown ? "hide the top bar (the panel takes the whole window)" : "show the top bar (status)";
   fit();
 }
 function toggleBar(show) {
@@ -481,23 +551,25 @@ function refreshMapped() {
   document.querySelectorAll(".k[data-id]").forEach(el => {
     const k = keyOf(el);
     el.classList.toggle("unmapped", !k && !CHORDS[el.dataset.id]);
-    el.title = k ? `${el.dataset.id}: row ${hex(k[0])} bit ${k[1]}` : `${el.dataset.id}: not in key_map.json`;
+    el.title = !can("controls") ? "" : k ? `${el.dataset.id}: row ${hex(k[0])} bit ${k[1]}` : `${el.dataset.id}: not in key_map.json`;
   });
   document.querySelectorAll(".knob").forEach(el => {
     const r = rowOfKnob(el);
-    el.title = !el.classList.contains("live") ? potTitle()
+    el.title = !can("controls") ? "" : !el.classList.contains("live") ? potTitle()
              : r != null ? `${el.dataset.id}: encoder row ${hex(r)} — endless: wheel/drag turns it (every detent goes to the firmware); double-click sets the parameter it controls on the current page back to its init value (through the firmware); with a TRIG key held (Shift-click latches it) a double-click is the encoder's PUSH (matrix 0x27.${r - 0x30}): it removes that step's lock on this parameter, as [TRIG] + knob press does on the unit (toggle: with no lock it sets one at the current value)`
              : `${el.dataset.id}: not in key_map.json`;
   });
 }
 
 async function sendKey(row, bit, down) {
-  const r = await fetch(`/key?row=${row}&bit=${bit}&down=${down ? 1 : 0}`).then(x => x.json());
+  if (!can("controls")) return;
+  const r = await panelFetch(`/key?row=${row}&bit=${bit}&down=${down ? 1 : 0}`).then(x => x.json());
   hint(`row ${hex(row)} bit ${bit} ${down ? "dn" : "up"}: ${r.result}`);
   return r;
 }
 async function sendKnob(row, delta, note = "") {
-  const r = await fetch(`/knob?row=${hex(row)}&delta=${delta}`).then(x => x.json());
+  if (!can("controls")) return;
+  const r = await panelFetch(`/knob?row=${hex(row)}&delta=${delta}`).then(x => x.json());
   hint(`encoder ${hex(row)} ${delta > 0 ? "+" : ""}${delta}: ${r.result}${note}`);
   return r;
 }
@@ -526,11 +598,13 @@ function funcEl() {
   return [...document.querySelectorAll(".k[data-id]")].find(el => { const k = keyOf(el); return k && k[0] === FUNC_KEY[0] && k[1] === FUNC_KEY[1]; });
 }
 function holdFunc() {
+  if (!can("controls")) return;
   const el = funcEl();
   if (!el || el.classList.contains("held") || el.classList.contains("down")) return;
   el.classList.add("held"); sendKey(FUNC_KEY[0], FUNC_KEY[1], true);
 }
 document.addEventListener("mousedown", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".k[data-id]");
   if (!el) return;
   e.preventDefault();
@@ -546,7 +620,7 @@ document.addEventListener("mousedown", e => {
     const t = {play: "play", rec: "rec", stop: "stop"}[el.dataset.id];
     if (t) {
       el.classList.add("down");
-      fetch(`/transport?k=${t}`).then(x => x.json()).then(r => hint(`${t.toUpperCase()} via key handler: ${r.result}`));
+      panelFetch(`/transport?k=${t}`).then(x => x.json()).then(r => hint(`${t.toUpperCase()} via key handler: ${r.result}`));
       return;
     }
     hint(`"${el.dataset.id}" is not in key_map.json`); return;
@@ -565,6 +639,7 @@ document.addEventListener("mousedown", e => {
   sendKey(k[0], k[1], true);
 });
 document.addEventListener("mouseup", () => {
+  if (!can("controls")) { cancelControls(); return; }
   document.querySelectorAll(".k.down").forEach(el => {
     el.classList.remove("down");
     if (el.dataset.chord) {                      // release the chord, key before FUNC
@@ -587,6 +662,7 @@ function releaseHeld(sel = ".k.held") {
 // "keydown"/"keyup" with e.key (WKWebView and Chrome agree on "Shift");
 // a held Shift may auto-repeat keydown on some systems, hence e.repeat.
 document.addEventListener("keydown", e => {
+  if (!can("controls")) return;
   if (e.key === "Shift") { if (!e.repeat) { shiftHeld = true; holdFunc(); } return; }
   // preventDefault: an unhandled keydown falls through WKWebView to the
   // window's responder chain and macOS beeps on every auto-repeat.
@@ -595,6 +671,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") { e.preventDefault(); if (!e.repeat) releaseHeld(); return; }
 });
 document.addEventListener("keyup", e => {
+  if (!can("controls")) return;
   if (e.key === "Shift") { shiftHeld = false; releaseHeld(); }
   if (e.key === "a" || e.key === "A") aHeld = false;
   if (e.key === "z" || e.key === "Z") { zHeld = false; releaseHeld(".k.held[data-z]"); }   // let go of what Z held
@@ -634,6 +711,7 @@ function drawKnob(el) {
 document.querySelectorAll(".knob.live").forEach(drawKnob);   // all start at 12 o'clock
 const pending = new Map();
 function turn(el, detents) {
+  if (!can("controls")) return;
   if (!detents) return;
   const row = rowOfKnob(el);
   if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
@@ -647,16 +725,18 @@ function turn(el, detents) {
   }, 80);
   pending.set(el, p);
 }
-async function flushTurn(el, row) {                        // what the wheel left in the 80 ms coalescer goes out first
+async function flushTurn(el, row) {
+  if (!can("controls")) return;   // queued detents go out before reset/press
   const p = pending.get(el);
   if (p) { clearTimeout(p.timer); pending.delete(el); if (p.n) await sendKnob(row, p.n); }
 }
 async function resetKnob(el) {
+  if (!can("controls")) return;
   const row = rowOfKnob(el);
   if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
   await flushTurn(el, row);
   hint(`${el.dataset.id}: back to init…`);
-  const r = await fetch(`/knob/reset?row=${hex(row)}`).then(x => x.json());
+  const r = await panelFetch(`/knob/reset?row=${hex(row)}`).then(x => x.json());
   if (r.ok) {
     el.dataset.pos = 0; drawKnob(el);
     hint(`${el.dataset.id}: ${r.name} on ${r.page} (T${r.track}) ${r.before === r.after ? "already at init" : `${r.before} → ${r.after}`} (init ${r.init}, ${r.sent.length} report${r.sent.length === 1 ? "" : "s"} sent)`);
@@ -667,10 +747,11 @@ function trigHeld() {
   return [...document.querySelectorAll(".k.held, .k.down")].some(el => { const k = keyOf(el); return !!k && (k[0] === 0x20 || k[0] === 0x21); });
 }
 async function pressKnob(el) {
+  if (!can("controls")) return;
   const row = rowOfKnob(el);
   if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
   await flushTurn(el, row);
-  const r = await fetch(`/knob/press?row=${hex(row)}`).then(x => x.json());
+  const r = await panelFetch(`/knob/press?row=${hex(row)}`).then(x => x.json());
   if (r.ok) hint(`${el.dataset.id} pressed (matrix ${r.cell}, ${r.hold_ms} ms${r.held && r.held.length ? "; held: " + r.held.join(" ") : ""}) — ${r.note}`);
   else hint(`${el.dataset.id}: push not sent — ${r.note}`);
 }
@@ -680,6 +761,7 @@ async function pressKnob(el) {
 // second press lands inside the firmware's double-tap window (a third
 // double tap would close the list again, so nothing extra is sent here).
 document.addEventListener("dblclick", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
@@ -687,6 +769,7 @@ document.addEventListener("dblclick", e => {
 });
 const wheelAcc = new Map();
 document.addEventListener("wheel", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
@@ -701,12 +784,14 @@ document.addEventListener("wheel", e => {
 }, {passive: false});
 let drag = null;
 document.addEventListener("mousedown", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".knob.live");
   if (!el) return;
   e.preventDefault();
   drag = {el, y: e.clientY};
 });
 document.addEventListener("mousemove", e => {
+  if (!can("controls")) return;
   if (!drag) return;
   const d = Math.trunc((drag.y - e.clientY) / 6);   // one detent per 6 px of drag, up = +
   if (d) { drag.y -= d * 6; turn(drag.el, d); }
@@ -727,6 +812,7 @@ document.addEventListener("mouseup", () => { drag = null; });
 const FADER = {pos: null, want: null, timer: 0, drag: false, focus: false, scenes: ""};
 const FBED = $("#fbed"), FHANDLE = $("#fhandle");
 function drawFader() {
+  if (!can("controls")) { FHANDLE.title = FBED.title = ""; return; }
   if (FADER.pos == null) { FHANDLE.title = FBED.title = "CROSSFADER"; return; }
   const travel = (((window.SKIN || {}).fader || {}).travel || {}).max || 166;
   const hd = document.getElementById("fader-handle");   // the skin's handle: translate in x, 0 = far left
@@ -734,9 +820,10 @@ function drawFader() {
   FHANDLE.title = FBED.title = `CROSSFADER at ${FADER.pos} (0 = scene A, 127 = scene B; = MIDI CC 48)${FADER.scenes} — drag, wheel (Shift ×8) or ←/→ after a click; the firmware morphs the scene locks`;
 }
 async function faderRefresh() {
+  if (!can("controls")) return;
   if (FADER.drag || FADER.timer) return;
   try {
-    const r = await fetch("/xfader").then(x => x.json());
+    const r = await panelFetch("/xfader").then(x => x.json());
     if (r.ok && typeof r.pos === "number") {
       FADER.pos = r.pos;
       FADER.scenes = r.scene_a ? ` · scenes ${r.scene_a} / ${r.scene_b}` : "";
@@ -745,13 +832,15 @@ async function faderRefresh() {
   } catch (e) {}
 }
 async function sendFader(pos) {
-  const r = await fetch(`/xfader?pos=${pos}`).then(x => x.json());
+  if (!can("controls")) return;
+  const r = await panelFetch(`/xfader?pos=${pos}`).then(x => x.json());
   if (r.ok) {
     FADER.pos = r.pos; FADER.scenes = r.scene_a ? ` · scenes ${r.scene_a} / ${r.scene_b}` : ""; drawFader();
     hint(`crossfader ${r.pos} (firmware ${r.xf}, CC 48 = ${r.cc48}; 0x40 ${r.byte} on the panel link)${FADER.scenes}`);
   } else hint(`crossfader: ${r.note || "not sent"}`);
 }
 function setFader(pos) {
+  if (!can("controls")) return;
   pos = Math.max(0, Math.min(127, Math.round(pos)));
   if (pos === FADER.pos) return;
   FADER.pos = pos; drawFader();
@@ -766,16 +855,22 @@ function faderPosFromX(clientX) {
   return (clientX - rect.left - (6 + 15) * s) / (travel * s) * 127;
 }
 for (const el of [FBED, FHANDLE]) el.addEventListener("mousedown", e => {
+  if (!can("controls")) return;
   e.preventDefault();
   FADER.drag = true; FADER.focus = true; FHANDLE.classList.add("focus");
   if (el === FBED) setFader(faderPosFromX(e.clientX));
 });
-document.addEventListener("mousemove", e => { if (FADER.drag) setFader(faderPosFromX(e.clientX)); });
+document.addEventListener("mousemove", e => {
+  if (!can("controls")) return;
+  if (FADER.drag) setFader(faderPosFromX(e.clientX));
+});
 document.addEventListener("mouseup", () => { FADER.drag = false; });
 document.addEventListener("mousedown", e => {
+  if (!can("controls")) return;
   if (!e.target.closest("#fbed, #fhandle")) { FADER.focus = false; FHANDLE.classList.remove("focus"); }
 }, true);
 for (const el of [FBED, FHANDLE]) el.addEventListener("wheel", e => {
+  if (!can("controls")) return;
   e.preventDefault();
   if (FADER.pos == null) return;
   const raw = e.deltaY || e.deltaX;
@@ -783,6 +878,7 @@ for (const el of [FBED, FHANDLE]) el.addEventListener("wheel", e => {
   setFader(FADER.pos + (raw < 0 ? 1 : -1) * (e.shiftKey ? 8 : 1));   // wheel up = towards B (right)
 }, {passive: false});
 document.addEventListener("keydown", e => {
+  if (!can("controls")) return;
   if (!FADER.focus || FADER.pos == null) return;
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
     e.preventDefault();
@@ -801,6 +897,7 @@ const arrowKey = e => {
   return id;
 };
 document.addEventListener("keydown", e => {
+  if (!can("controls")) return;
   const id = arrowKey(e);
   if (!id) return;
   e.preventDefault();
@@ -812,6 +909,7 @@ document.addEventListener("keydown", e => {
   sendKey(k[0], k[1], true);
 });
 document.addEventListener("keyup", e => {
+  if (!can("controls")) return;
   const id = arrowKey(e);
   if (!id) return;
   e.preventDefault();
@@ -842,6 +940,7 @@ const HOWTO = `<b>To put a pool file in a slot on the unit</b> (after RE-INSERT 
   Details: <code>tools/panel/README.md</code>, "Loading samples".`;
 const fmtBytes = n => n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? Math.round(n / 1e3) + " kB" : n + " B";
 function togglePool(open) {
+  if (!can("samples")) return;
   poolOpen = open === undefined ? !poolOpen : !!open;
   $("#pool").classList.toggle("open", poolOpen);
   $("#card").classList.toggle("open", poolOpen);
@@ -853,8 +952,9 @@ function poolLog(msg, cls = "") {
   const log = $("#poollog"); log.append(d); log.scrollTop = log.scrollHeight;
 }
 async function loadPool() {
+  if (!can("samples")) return;
   try {
-    const r = await fetch("/samples");
+    const r = await panelFetch("/samples");
     if (!r.ok) throw new Error(`HTTP ${r.status} (this panel_server.py has no /samples)`);
     poolData = await r.json();
   } catch (e) {
@@ -908,6 +1008,7 @@ function renderPool() {
   $("#addbtn").disabled = !poolData || !!d.busy;
 }
 async function uploadFiles(files) {
+  if (!can("samples")) return;
   files = [...files].filter(f => f && f.name);
   if (!files.length) return;
   if (!poolOpen) togglePool(true);
@@ -915,7 +1016,7 @@ async function uploadFiles(files) {
     hint(`uploading ${f.name} (${fmtBytes(f.size)})…`);
     let r;
     try {
-      const resp = await fetch(`/samples/upload?name=${encodeURIComponent(f.name)}`, {method: "POST", body: f});
+      const resp = await panelFetch(`/samples/upload?name=${encodeURIComponent(f.name)}`, {method: "POST", body: f});
       r = await resp.json();
     } catch (e) { r = {ok: false, error: `upload failed: ${e.message}`}; }
     if (r.ok) { poolDirty = true; poolLog(`${f.name} → ${r.name}${r.converted ? " (converted)" : ""}${r.note ? ": " + r.note : ""}`, r.converted ? "conv" : ""); }
@@ -925,9 +1026,10 @@ async function uploadFiles(files) {
   await loadPool();
 }
 async function removeFile(name) {
+  if (!can("samples")) return;
   const wasPending = !!poolData && (poolData.pending || []).includes(name);   // never on the card: nothing changes there
   let r;
-  try { r = await fetch(`/samples/remove?name=${encodeURIComponent(name)}`).then(x => x.json()); }
+  try { r = await panelFetch(`/samples/remove?name=${encodeURIComponent(name)}`).then(x => x.json()); }
   catch (e) { r = {ok: false, error: e.message}; }
   if (r.ok) { if (!wasPending) poolDirty = true; poolLog(`${name}: removed from the pool`); }
   else poolLog(`${name}: remove failed: ${r.error || "?"}`, "bad");
@@ -936,6 +1038,7 @@ async function removeFile(name) {
 // Two clicks (no confirm(): WKWebView answers false to it without a UI
 // delegate): the first arms the button for 5 s, the second commits.
 async function reinsert() {
+  if (!can("card")) return;
   const b = $("#reinsert");
   if (!b.classList.contains("armed")) {
     b.classList.add("armed"); b.textContent = "REBOOT THE UNIT? CLICK AGAIN";
@@ -946,7 +1049,7 @@ async function reinsert() {
   clearTimeout(armTimer);
   b.classList.remove("armed"); b.textContent = "RE-INSERT CARD"; b.disabled = true;
   let r;
-  try { r = await fetch("/samples/commit").then(x => x.json()); }
+  try { r = await panelFetch("/samples/commit").then(x => x.json()); }
   catch (e) { r = {ok: false, error: e.message}; }
   if (r.ok) { poolDirty = false; poolLog(`card re-inserted: ${r.phase || "the unit reboots"}`); hint(r.phase || "re-inserting the card"); }
   else { poolLog(`re-insert failed: ${r.error || "?"}`, "bad"); b.disabled = false; }
@@ -975,9 +1078,10 @@ function poolPhase(phase, s) {
   if (poolOpen) loadPool(); else if (poolData) renderPool();
 }
 async function insertCard() {
+  if (!can("card")) return;
   const b = $("#insertbtn"); if (b) b.disabled = true;
   let r;
-  try { r = await fetch("/card/insert").then(x => x.json()); } catch (e) { r = {ok: false, error: e.message}; }
+  try { r = await panelFetch("/card/insert").then(x => x.json()); } catch (e) { r = {ok: false, error: e.message}; }
   if (r.ok) { poolLog(`card inserted: ${r.phase || "the unit boots"}`); hint(r.phase || "inserting the card"); }
   else { poolLog(`insert failed: ${r.error || "?"}`, "bad"); if (b) b.disabled = false; }
 }
@@ -986,7 +1090,7 @@ $("#addinput").addEventListener("change", e => { uploadFiles(e.target.files); e.
 // would navigate to the file, so the window swallows those
 const hasFiles = e => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).indexOf("Files") >= 0;   // types is a DOMStringList in WebKit
 for (const t of [$("#card"), $("#pool")]) {
-  t.addEventListener("dragover", e => { if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; t.classList.add("drop"); });
+  t.addEventListener("dragover", e => { if (!can("samples")) return; if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; t.classList.add("drop"); });
   t.addEventListener("dragleave", e => { if (!t.contains(e.relatedTarget)) t.classList.remove("drop"); });
   t.addEventListener("drop", e => { e.preventDefault(); t.classList.remove("drop"); uploadFiles(e.dataTransfer.files); });
 }
@@ -1038,10 +1142,11 @@ function potTitle() {
 function drawPot() {
   const SWEEP = 300;   // the pot's travel: 7 o'clock (0 %) to 5 o'clock (100 %), as before the encoders went endless
   POT.querySelector(".cap").style.transform = `rotate(${-SWEEP / 2 + vol * SWEEP / 100}deg)`;
-  POT.title = potTitle();
+  POT.title = can("audio") ? potTitle() : "";
   if (MON.gain) MON.gain.gain.value = vol / 100;
 }
 function setVol(v, note = "") {
+  if (!can("audio")) return;
   const nv = Math.max(0, Math.min(100, Math.round(v)));
   if (nv === vol) { if (vol === 100 || vol === 0) hint(`VOLUME at its ${vol ? "end (100 %)" : "start (0 %)"}`); return; }
   vol = nv; drawPot();
@@ -1051,12 +1156,14 @@ function setVol(v, note = "") {
 drawPot();
 let potDrag = null;
 document.addEventListener("mousedown", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".knob.pot");
   if (!el) return;
   e.preventDefault();
   potDrag = {y: e.clientY};
 });
 document.addEventListener("mousemove", e => {
+  if (!can("controls")) return;
   if (!potDrag) return;
   const d = Math.trunc((potDrag.y - e.clientY) / 3);   // 1 % per 3 px of drag, up = louder
   if (d) { potDrag.y -= d * 3; setVol(vol + d); }
@@ -1064,6 +1171,7 @@ document.addEventListener("mousemove", e => {
 document.addEventListener("mouseup", () => { potDrag = null; });
 let potAcc = 0;
 document.addEventListener("wheel", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".knob.pot");
   if (!el) return;
   e.preventDefault();
@@ -1074,6 +1182,7 @@ document.addEventListener("wheel", e => {
   if (d) setVol(vol - d);                                // wheel up = louder
 }, {passive: false});
 document.addEventListener("dblclick", e => {
+  if (!can("controls")) return;
   const el = e.target.closest(".knob.pot");
   if (!el) return;
   e.preventDefault();
@@ -1133,7 +1242,8 @@ function monSkip() {
   monDrop(); MON.from = target;
 }
 async function audioStatus() {
-  const r = await fetch("/audio/status");
+  if (!can("audio")) return;
+  const r = await panelFetch("/audio/status");
   if (!r.ok) throw new Error(`HTTP ${r.status} (this panel_server.py has no /audio endpoints)`);
   const st = await r.json();
   MON.status = st;
@@ -1152,7 +1262,7 @@ async function monLoop(gen) {
       } else if (behindFrames() > MON_SKIP + 2 * MON_RATE) monSkip();   // > 22 s behind: skip ahead to 20 s behind
       // (checked BEFORE the fetch, with 2 s of hysteresis: a check after the fetch
       // re-skipped on every poll when the source outran real time, 12 Sep 2026)
-      const r = await fetch(`/audio/pcm?from=${MON.from}&max=${MON_MAX}`);
+      const r = await panelFetch(`/audio/pcm?from=${MON.from}&max=${MON_MAX}`);
       if (MON.gen !== gen) return;
       const end = parseInt(r.headers.get("X-Audio-End") || "", 10);
       if (r.status === 204) {
@@ -1184,6 +1294,7 @@ function monReadout() {
 }
 const monBusy = () => !!MON.phase && MON.phase !== "ready";   // booting, a re-insert, a sound reboot
 function monToggle() {
+  if (!can("audio")) return;
   if (MON.on) { monStop("headphones unplugged"); return; }
   if (monBusy()) { toggleMon(true); hint(`the unit is busy — ${MON.phase}`); return; }
   if (MON.sound === false) { toggleMon(true); hint(SOUND_OFF_MSG); return; }
@@ -1228,13 +1339,15 @@ function meterLoop() {
 
 // -- the SOUND drawer --
 function toggleMon(open) {
+  if (!can("audio")) return;
   MON.open = open === undefined ? !MON.open : !!open;
   $("#mon").classList.toggle("open", MON.open);
   $("#monbtn").classList.toggle("on", MON.open);
   if (MON.open) { refreshAudioStatus(); if (!barShown) toggleBar(true); }   // the drawer lives in the bar
   monRender(); fit();
 }
-async function refreshAudioStatus() {                      // every second while the drawer is open or the headphones are in
+async function refreshAudioStatus() {
+  if (!can("audio")) return;
   if (MON.statusBusy) return;
   MON.statusBusy = true; clearTimeout(MON.statusTimer);
   try { await audioStatus(); MON.statusErr = null; } catch (e) { MON.statusErr = e.message; }
@@ -1252,6 +1365,7 @@ function soundLabel() {
                                 : "reboot the unit without the DSP cores (~40 s): no sound, a faster sequencer";
 }
 async function soundToggle() {
+  if (!can("audio")) return;
   const b = $("#soundbtn"), on = MON.sound === false;      // the action: turn it on when it is off
   if (!b.classList.contains("armed")) {
     b.classList.add("armed"); b.textContent = `REBOOT THE UNIT (${on ? "~1 MIN" : "~40 S"})? CLICK AGAIN`;
@@ -1261,7 +1375,7 @@ async function soundToggle() {
   }
   clearTimeout(MON.armTimer); b.classList.remove("armed"); b.disabled = true; soundLabel();
   let r;
-  try { r = await fetch(`/audio/enable?on=${on ? 1 : 0}`).then(x => x.json()); }
+  try { r = await panelFetch(`/audio/enable?on=${on ? 1 : 0}`).then(x => x.json()); }
   catch (e) { r = {ok: false, note: e.message}; }
   if (r.ok) { MON.phase = r.phase || "rebooting"; hint(`sound ${on ? "on" : "off"}: ${MON.phase}`); }
   else { hint(`sound ${on ? "on" : "off"} refused: ${r.note || r.error || "?"}`); b.disabled = false; }
@@ -1366,25 +1480,28 @@ function applyLeds(l) {
 // 20 ms apart in the server); the 350 ms status poll only carries the LEDs
 // while the stream is down (it used to be the only source and skipped two
 // of every three steps of the running light at 120 BPM, 13 Sep 2026).
-let ledStreamOn = false, ledStream = null;
+let ledStreamOn = false, ledStream = null, ledRetry = 0;
 function startLedStream() {
-  if (!window.EventSource) return;
+  if (!can("leds") || !window.EventSource || ledStream) return;
   try { ledStream = new EventSource("/leds/stream"); } catch (e) { return; }
   ledStream.onopen = () => { ledStreamOn = true; };
   ledStream.onmessage = ev => { try { if (Object.keys(mapLeds).length) applyLeds(JSON.parse(ev.data)); } catch (e) {} };
   ledStream.onerror = () => {                      // the server rebooted / went away: poll until it is back
     ledStreamOn = false;
     try { ledStream.close(); } catch (e) {}
-    setTimeout(startLedStream, 2000);
+    ledStream = null;
+    ledRetry = setTimeout(startLedStream, 2000);
   };
 }
-startLedStream();
 
 // ---------------- status poll ----------------
 let lastSeq = -1, lastFault = null;
 async function poll() {
   try {
-    const s = await fetch("/status").then(x => x.json());
+    const s = await panelFetch("/status").then(x => x.json());
+    if (!s || typeof s !== "object") throw new Error("invalid status");
+    sourceStatus(s);
+    if (source !== "port") { renderPhysicalStatus(s); return; }
     $("#imginfo").textContent = (s.image || "").split("/").pop();
     const phase = s.phase || (s.booted ? "ready" : "booting");
     const ph = $("#phase");
@@ -1399,25 +1516,60 @@ async function poll() {
     $("#screen").classList.toggle("dim", busy);
     $("#note").classList.toggle("show", busy);
     $("#note span").textContent = busy ? `loading — ${phase}` : "";
-    poolPhase(phase, s);
-    monPhase(s, phase);
+    if (can("samples") && can("card")) poolPhase(phase, s);
+    if (can("audio")) monPhase(s, phase);
     if (s.seq !== lastSeq) { lastSeq = s.seq; $("#screen").src = "/screen.png?" + s.seq; }
-    if (Object.keys(mapLeds).length && !ledStreamOn) applyLeds(await fetch("/leds").then(x => x.json()));
+    if (can("leds") && Object.keys(mapLeds).length && !ledStreamOn) applyLeds(await panelFetch("/leds").then(x => x.json()));
     // the crossfader: the firmware's value, on the first ready poll and every ~3.5 s after
     if (!busy && (FADER.pos == null || ++pollN % 10 === 0)) faderRefresh();
-  } catch (e) {}
-  setTimeout(poll, 350);
+  } catch (e) {
+    // Transport failure revokes controls; preserve the last verified display.
+    sourceStatus({source, read_only:true, capabilities:[]});
+    $("#phase").textContent = "server unreachable"; $("#phase").className = "failed";
+    $("#note").classList.add("show"); $("#note span").textContent = "server unreachable — last verified frame";
+    document.body.classList.add("readonly");
+    for (const selector of ["#card", "#hp", "#monbtn", ".knob.pot"]) $(selector).title = "";
+    $("#monbtn").disabled = true;
+    refreshMapped(); drawFader();
+  } finally { setTimeout(poll, 350); }
 }
 let pollN = 0;
 
+function renderPhysicalStatus(s) {
+  const hardware = source === "hardware", state = hardware ? (s.connection_state || "connecting") : "unsupported";
+  const identity = s.device || {}, protocol = s.protocol || {};
+  const device = identity.serial || identity.selector || identity.topology || "unknown device";
+  const proto = protocol.version || (protocol.major != null ? `${protocol.major}.${protocol.minor || 0}` : "unknown");
+  $("#imginfo").textContent = `${device} · model ${s.model || "unknown"} · build ${s.build || "unknown"} · protocol ${proto}`;
+  const ph = $("#phase"); ph.textContent = state;
+  ph.className = state === "live" ? "ready" : ["connecting", "syncing", "busy"].includes(state) ? "busy" : "failed";
+  $("#rt").textContent = "";
+  $("#fault").textContent = s.error ? `${s.error.code}: ${s.error.message}` : "";
+  const frame = hardware && s.has_frame === true, live = frame && state === "live";
+  $("#screen").classList.toggle("dim", !live);
+  $("#note").classList.toggle("show", !live);
+  $("#note span").textContent = live ? "" : frame ? `${state} — last verified frame` : `${state} — waiting for a verified frame`;
+  const time = t => t == null ? "unknown" : new Date(typeof t === "number" ? t * 1000 : t).toLocaleTimeString();
+  hint(`contact ${time(s.last_contact_at)} · snapshot ${time(s.last_snapshot_at)} · display change ${time(s.last_display_change_at)}`);
+  if (frame && can("screen")) {
+    const seq = s.generation == null ? s.seq : s.generation;
+    if (seq !== lastSeq) { lastSeq = seq; $("#screen").src = "/screen.png?" + seq; }
+  }
+  if (can("leds") && Object.keys(mapLeds).length && !ledStreamOn) panelFetch("/leds").then(r => r.json()).then(applyLeds).catch(() => {});
+}
+
 async function loadMap() {
   try {
-    const m = await fetch("/map").then(x => x.json());
+    const m = await panelFetch("/map").then(x => x.json());
     mapKeys = m.keys || {}; mapKnobs = m.knobs || {}; mapLeds = m.leds || {};
   } catch (e) {}
   refreshMapped();
 }
 
+sourceStatus({});
+$("#source").textContent = "IDENTIFYING SOURCE";
+$("#note").classList.add("show"); $("#note span").textContent = "identifying source — waiting for a verified frame";
+$("#monbtn").disabled = true;
 drawBar(); loadMap(); poll();
 </script>
 </body>

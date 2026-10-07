@@ -152,6 +152,33 @@ final class PanelServer {
     let repo: URL
     let port: Int
     private(set) var process: Process?     // the one we spawned, if any
+    // Once an incompatible source is observed, this launcher stays refused.
+    // A timeout, retry, Reload, or later port response must never replace it.
+    private(set) var sourceRefusal: String?
+    private(set) var emulatorVerified = false
+
+    @discardableResult
+    func acceptStatus(_ status: [String: Any]?) -> Bool {
+        guard sourceRefusal == nil, let status = status else { return false }
+        let source = status["source"] as? String
+        let backend = status["backend"] as? String
+        let sourcePresent = status.keys.contains("source")
+        let backendPresent = status.keys.contains("backend")
+        let port = (source == "port" && (!backendPresent || backend == "port"))
+            || (!sourcePresent && backend == "port")
+        guard port, status["read_only"] as? Bool != true else {
+            emulatorVerified = false
+            sourceRefusal = "This native launcher supports emulator servers only. "
+                + "The server on port \(self.port) reports source \(source ?? "unknown") / backend \(backend ?? "unknown"). "
+                + "Open \(url.absoluteString) in a browser for the physical read-only viewer, "
+                + "or quit this app and choose a different emulator port with VIRTUAL_PANEL_PORT. "
+                + "This app will not stop or replace that server."
+            return false
+        }
+        emulatorVerified = true
+        return true
+    }
+
     var attached = false                   // answered when last probed and not ours to stop
     var onExit: ((String) -> Void)?        // a spawned server died: "status N" / "signal N (SIGxxx)" (main thread)
 
@@ -206,6 +233,10 @@ final class PanelServer {
     }
 
     func spawn(project: URL?, card: URL? = nil) throws {
+        guard sourceRefusal == nil else {
+            throw NSError(domain: "VirtualPanel.Source", code: 1, userInfo: [NSLocalizedDescriptionKey: sourceRefusal!])
+        }
+        emulatorVerified = false
         let p = Process()
         p.executableURL = repo.appendingPathComponent(".venv/bin/python3")   // the arm64 venv (EMAC-fixed Unicorn)
         p.arguments = arguments(project: project, card: card)
@@ -253,6 +284,7 @@ final class PanelServer {
     /// reached the app). /status carries `script_mtime` since 23 Sep 2026;
     /// no field = older still. Returns why it is stale, nil when current.
     func staleReason(_ status: [String: Any]?) -> String? {
+        guard acceptStatus(status) else { return nil }
         let path = repo.appendingPathComponent("tools/panel/panel_server.py").path
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let mod = attrs[.modificationDate] as? Date else { return nil }
@@ -270,6 +302,7 @@ final class PanelServer {
     /// every panel_server.py on this port). The server flushes the card and
     /// exits, as on quit.
     func terminateForeign(pid: Int) {
+        guard sourceRefusal == nil, emulatorVerified else { return }
         if pid > 1 {
             kill(pid_t(pid), SIGTERM)
             Log.write("sent SIGTERM to the stale server pid \(pid)")
@@ -306,6 +339,10 @@ final class PanelServer {
     /// -- else "HTTP 404", or the URL error). Completion on the main thread.
     func get(_ path: String, query: [(String, String)] = [], timeout: TimeInterval,
              _ done: @escaping (Bool, [String: Any]?, String) -> Void) {
+        guard path == "/status" || (sourceRefusal == nil && emulatorVerified) else {
+            done(false, nil, sourceRefusal ?? "Waiting to verify an emulator source with /status")
+            return
+        }
         var s = "http://127.0.0.1:\(port)" + path
         if !query.isEmpty {
             s += "?" + query.map { k, v in
@@ -330,7 +367,15 @@ final class PanelServer {
             } else {
                 why = "HTTP \(code)" + ((st?["error"] as? String).map { ": " + $0 } ?? "")
             }
-            DispatchQueue.main.async { done(ok, st, why) }
+            DispatchQueue.main.async {
+                if path == "/status", ok { self.acceptStatus(st) }
+                // A source mismatch discovered during this request also blocks
+                // callbacks that would apply remembered audio/card settings.
+                if path != "/status", self.sourceRefusal != nil {
+                    done(false, nil, self.sourceRefusal!); return
+                }
+                done(ok, st, why)
+            }
         }.resume()
     }
 
@@ -350,6 +395,10 @@ final class PanelServer {
     /// memory twice.
     func download(_ url: URL, to dest: URL, timeout: TimeInterval,
                   _ done: @escaping (Bool, Int, String, String) -> Void) {
+        guard sourceRefusal == nil, emulatorVerified else {
+            done(false, 0, sourceRefusal ?? "Waiting to verify an emulator source", "")
+            return
+        }
         let req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         Self.session.downloadTask(with: req) { tmp, resp, err in
             var ok = false, bytes = 0, why = ""
@@ -836,7 +885,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Attach if something already answers on the port, else spawn and poll.
     /// Also Reload's path when the server is not ours: a probe that fails
     /// then means it is gone and a fresh one is spawned, rather than waiting.
+    @discardableResult
+    func emulatorAllowed(_ status: [String: Any]? = nil) -> Bool {
+        if let status = status { server.acceptStatus(status) }
+        guard let refusal = server.sourceRefusal else { return true }
+        stopPolling()
+        statusPoll?.invalidate(); statusPoll = nil
+        probeGen += 1
+        pendingAdds.removeAll(); adding = false
+        soundOn = nil; phase = "source refused"
+        cardPathFromStatus = nil; cardPersistent = false; cardMount = nil; cardRw = nil
+        updateSoundItem(); updateCardItems()
+        panelShown = false
+        web.stopLoading()
+        showPlaceholder(refusal, failed: true)
+        return false
+    }
+
     func startServer() {
+        guard emulatorAllowed() else { return }
         stopPolling()
         probeGen += 1
         let gen = probeGen
@@ -844,6 +911,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         showPlaceholder("looking for a server on port \(server.port)")
         server.probe(timeout: 1.0) { [weak self] ok, status in
             guard let self = self, gen == self.probeGen else { return }   // superseded by a later Reload / Open Project
+            guard self.emulatorAllowed(ok ? status : nil) else { return }
             if ok, let why = self.server.staleReason(status) {
                 // an orphan running old code: retire it and start a fresh one
                 Log.write("the server on port \(self.server.port) is stale (\(why)): restarting it; status \(status ?? [:])")
@@ -875,8 +943,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// then `then`; gives up after `tries` x 0.25 s and proceeds anyway (the
     /// spawn's bind failure then says so in the log).
     func whenServerGone(gen: Int, tries: Int, then: @escaping () -> Void) {
-        server.probe(timeout: 0.3) { [weak self] ok, _ in
+        server.probe(timeout: 0.3) { [weak self] ok, status in
             guard let self = self, gen == self.probeGen else { return }
+            guard self.emulatorAllowed(ok ? status : nil) else { return }
             if !ok || tries <= 0 {
                 if ok { Log.write("the stale server on port \(self.server.port) is still answering; spawning anyway") }
                 then(); return
@@ -886,6 +955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func launch(project: URL?, card: URL? = nil) {
+        guard emulatorAllowed() else { return }
         var what = project.map { "project \($0.deletingLastPathComponent().lastPathComponent)/\($0.lastPathComponent)" } ?? "empty card"
         if let c = card { what = "card \(c.lastPathComponent)" + (project == nil ? "" : " (new, from \(what))") }
         do {
@@ -902,6 +972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Open Project... / New Card / Open Card: a spawned server is replaced;
     /// an attached one is not ours to restart, so say what to run instead.
     func restartServer(project: URL?, card: URL? = nil) {
+        guard emulatorAllowed() else { return }
         if server.attached {
             sheet("The server on port \(server.port) was not started by this app",
                   "Restart it yourself with the project, then choose File > Reload:\n\n"
@@ -916,6 +987,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func startPolling() {
+        guard emulatorAllowed() else { return }
         stopPolling()
         poll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollOnce() }
     }
@@ -926,12 +998,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func pollOnce() {
+        guard emulatorAllowed() else { return }
         if probing { return }
         probing = true
         server.probe(timeout: 0.4) { [weak self] ok, status in
             guard let self = self else { return }
             self.probing = false
-            guard ok, self.poll != nil else { return }
+            guard self.emulatorAllowed(ok ? status : nil), ok, self.poll != nil else { return }
             self.stopPolling()
             Log.write("server answered /status: \(status ?? [:])")
             self.loadPanel()
@@ -939,6 +1012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func loadPanel() {
+        guard emulatorAllowed() else { return }
         panelShown = true
         web.load(URLRequest(url: server.url, cachePolicy: .reloadIgnoringLocalCacheData))
     }
@@ -948,8 +1022,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// logged under `what` each time it changes, "no answer" while nothing
     /// listens on the port yet. Main thread.
     func whenReady(deadline: Date, what: String, seen: String = "", _ done: @escaping (Bool) -> Void) {
+        guard emulatorAllowed() else { done(false); return }
         server.probe(timeout: 2.0) { [weak self] ok, st in
             guard let self = self else { return }
+            guard self.emulatorAllowed(ok ? st : nil) else { done(false); return }
             let phase = ok ? (st?["phase"] as? String ?? "?") : "no answer"
             if phase == "ready" { done(true); return }
             if phase == "failed" { Log.write("\(what): the server failed: \(st?["fault"] ?? "")"); done(false); return }
@@ -984,6 +1060,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     // MARK: menu actions
 
     @objc func openProject(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -993,7 +1070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let projects = repo.appendingPathComponent("out/_projects")
         if FileManager.default.fileExists(atPath: projects.path) { panel.directoryURL = projects }
         panel.beginSheetModal(for: window) { [weak self] resp in
-            guard let self = self, resp == .OK, let dir = panel.url else { return }
+            guard let self = self, self.emulatorAllowed(), resp == .OK, let dir = panel.url else { return }
             UserDefaults.standard.set(dir.path, forKey: Self.projectKey)
             UserDefaults.standard.removeObject(forKey: Self.cardKey)   // back to the scratch card until a card is chosen again
             self.launchCard = nil
@@ -1009,6 +1086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// the project and its sibling AUDIO), remembered and booted. An image
     /// of that name that exists is offered as it is (Open) or replaced.
     @objc func newCardFromProject(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -1018,13 +1096,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let projects = repo.appendingPathComponent("out/_projects")
         if FileManager.default.fileExists(atPath: projects.path) { panel.directoryURL = projects }
         panel.beginSheetModal(for: window) { [weak self] resp in
-            guard let self = self, resp == .OK, let dir = panel.url else { return }
+            guard let self = self, self.emulatorAllowed(), resp == .OK, let dir = panel.url else { return }
             let card = self.defaultCard(for: dir)
             if FileManager.default.fileExists(atPath: card.path) {
                 self.sheet("A card for this project already exists",
                            "\(card.path)\n\nOpen it as it is (what the unit saved into it stays), or replace it with a fresh card from the project folder?",
                            buttons: ["Open Existing", "Replace", "Cancel"]) { b in
-                    if b == 2 { return }
+                    guard self.emulatorAllowed(), b != 2 else { return }
                     if b == 1 {
                         for suffix in ["", ".json"] {
                             try? FileManager.default.removeItem(atPath: card.path + suffix)
@@ -1041,6 +1119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     /// Open Card...: an existing .img (its sidecar, or the sets on it, name the project).
     @objc func openCard(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -1053,7 +1132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let cards = repo.appendingPathComponent("out/cards")
         if FileManager.default.fileExists(atPath: cards.path) { panel.directoryURL = cards }
         panel.beginSheetModal(for: window) { [weak self] resp in
-            guard let self = self, resp == .OK, let img = panel.url else { return }
+            guard let self = self, self.emulatorAllowed(), resp == .OK, let img = panel.url else { return }
             self.useCard(img, project: nil, source: "Open Card")
         }
     }
@@ -1061,6 +1140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Open Firmware Image...: a remix .bin (REMIX=<name> make bus -> out/mainos_bus.bin)
     /// instead of the stock OS; remembered, the unit reboots on it (14 Sep 2026).
     @objc func openImage(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -1073,7 +1153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let out = repo.appendingPathComponent("out")
         if FileManager.default.fileExists(atPath: out.path) { panel.directoryURL = out }
         panel.beginSheetModal(for: window) { [weak self] resp in
-            guard let self = self, resp == .OK, let img = panel.url else { return }
+            guard let self = self, self.emulatorAllowed(), resp == .OK, let img = panel.url else { return }
             UserDefaults.standard.set(img.path, forKey: Self.imageKey)
             Log.write("firmware image chosen (remembered): \(img.path)")
             self.rebootOnCurrentCard()
@@ -1081,6 +1161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     @objc func useStockImage(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         UserDefaults.standard.removeObject(forKey: Self.imageKey)
         Log.write("firmware image: back to the stock image")
         rebootOnCurrentCard()
@@ -1088,6 +1169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     /// Restart the server on whatever card/project it runs on now (the image comes from imagePath).
     func rebootOnCurrentCard() {
+        guard emulatorAllowed() else { return }
         if let c = UserDefaults.standard.string(forKey: Self.cardKey), FileManager.default.fileExists(atPath: c) {
             restartServer(project: nil, card: URL(fileURLWithPath: c))
         } else {
@@ -1098,6 +1180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Remember the card and restart the server on it (`project` only when
     /// the image is to be created from it).
     func useCard(_ card: URL, project: URL?, source: String) {
+        guard emulatorAllowed() else { return }
         UserDefaults.standard.set(card.path, forKey: Self.cardKey)
         launchCard = nil
         Log.write("card chosen (\(source), remembered): \(card.path)" + (project.map { " from \($0.path)" } ?? ""))
@@ -1120,6 +1203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// GET /card/insert (the server cleans macOS's droppings, detaches,
     /// boots). Refusals are sheets with the server's error.
     @objc func ejectOrInsertCard(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         if cardEjected {
             Log.write("card: GET /card/insert")
             server.get("/card/insert", timeout: 30) { [weak self] ok, r, why in
@@ -1195,11 +1279,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// first Reload instead of being waited for forever (the old isUp check
     /// never cleared `attached`).
     @objc func reload(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         Log.write("reload")
-        if server.running {
-            if panelShown { web.reload() } else { startPolling() }
-        } else {
-            startServer()
+        server.probe(timeout: 1.0) { [weak self] ok, status in
+            guard let self = self, self.emulatorAllowed(ok ? status : nil) else { return }
+            if ok { self.loadPanel() }
+            else if self.server.running { self.startPolling() }
+            else { self.startServer() }
         }
     }
 
@@ -1250,6 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     @objc func addSamples(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1268,6 +1355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// alert or answer). `autoAnswer` "commit" / "later" replaces the alert
     /// (VIRTUAL_PANEL_ADD_THEN); nil shows it.
     func addSamples(_ urls: [URL], source: String, autoAnswer: String? = nil) {
+        guard emulatorAllowed() else { return }
         Log.write("add (\(source)): \(urls.count) path(s)\(adding ? ", queued behind the running batch" : "")")
         pendingAdds.append(AddRequest(urls: urls, source: source, autoAnswer: autoAnswer))
         drainPendingAdds()
@@ -1280,6 +1368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// and adds are refused while a re-insert runs. `adding` holds from here
     /// until the batch's alert, and the commit it may start, are done.
     func drainPendingAdds() {
+        guard emulatorAllowed() else { return }
         guard window != nil, !adding, !quitting, !pendingAdds.isEmpty else { return }
         adding = true
         let r = pendingAdds.removeFirst()
@@ -1306,6 +1395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// /samples/add?path=<abs>, then the alert, Re-insert being GET
     /// /samples/commit.
     func runAddBatch(_ req: AddRequest) {
+        guard emulatorAllowed() else { return }
         let source = req.source
         let (files, skipped) = Self.sampleFiles(req.urls)
         for u in skipped { Log.write("add (\(source)): skipped, not an audio file: \(u.path)") }
@@ -1393,6 +1483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// reply, or with the failure sheet; a queued batch then waits for
     /// ready again, i.e. for the reboot.
     func commit() {
+        guard emulatorAllowed() else { return }
         server.get("/samples/commit", timeout: 30) { [weak self] ok, r, why in
             guard let self = self else { return }
             if ok, let r = r, r["ok"] as? Bool == true {
@@ -1448,6 +1539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func noteStatus(_ st: [String: Any]?) {
+        guard emulatorAllowed(st) else { return }
         let sound = st?["sound"] as? Bool
         let ph = st.map { $0["phase"] as? String ?? "?" } ?? "no answer"
         soundNote = st?["sound_note"] as? String ?? ""
@@ -1539,6 +1631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// GET /audio/devices -- the list, the output's state and the capture
     /// mode in one reply -- then the submenu rebuilt.
     func refreshOutputMenu() {
+        guard emulatorAllowed() else { return }
         guard !outputRefreshing, !quitting else { return }
         outputRefreshing = true
         server.get("/audio/devices", timeout: 5) { [weak self] ok, r, why in
@@ -1584,6 +1677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     /// A pick in the submenu: remembered (Off forgets), sent to the server.
     @objc func chooseOutput(_ sender: NSMenuItem) {
+        guard emulatorAllowed() else { return }
         let name = (sender.representedObject as? String) ?? "off"
         launchOutput = nil     // a choice made here outranks the hook for the rest of the launch
         if name == "off" { UserDefaults.standard.removeObject(forKey: Self.outputKey) }
@@ -1596,6 +1690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// channels, latency, map), the menu state refreshed; a refusal is
     /// logged and, from the menu, shown as a sheet.
     func applyOutput(_ name: String, source: String) {
+        guard emulatorAllowed() else { return }
         Log.write("output (\(source)): GET /audio/output?device=\(name)")
         server.get("/audio/output", query: [("device", name)], timeout: 15) { [weak self] ok, r, why in
             guard let self = self else { return }
@@ -1655,6 +1750,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// flow; a sheet says why when there is nothing, or the server has no
     /// audio endpoints (HTTP 404).
     @objc func saveMainOut(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         server.get("/audio/status", timeout: 10) { [weak self] ok, r, why in
             guard let self = self else { return }
             guard ok, let r = r else {
@@ -1680,6 +1776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// for an intercepted link), remembering the folder, then the download
     /// to the chosen file. VIRTUAL_PANEL_SAVE_DIR skips the panel.
     func saveRecording(_ url: URL, suggested: String, source: String) {
+        guard emulatorAllowed() else { return }
         guard !quitting else { return }
         Log.write("save (\(source)): \(url.absoluteString) as \(suggested)")
         if let dir = saveDir {
@@ -1722,6 +1819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Audio > Show Takes Folder: the folder of the takes /audio/status lists
     /// (out/_panel_takes_<port>/ in the repo), in Finder.
     @objc func showTakesFolder(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         server.get("/audio/status", timeout: 10) { [weak self] ok, r, why in
             guard let self = self else { return }
             let conventional = self.repo.appendingPathComponent("out/_panel_takes_\(self.server.port)")
@@ -1748,6 +1846,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// Audio > Sound: the checkbox as it is now flipped, after a sheet that
     /// says the unit reboots.
     @objc func toggleSound(_ sender: Any?) {
+        guard emulatorAllowed() else { return }
         guard let cur = soundOn else { return }
         let on = !cur
         sheet(on ? "Switch sound on?" : "Switch sound off?",
@@ -1764,6 +1863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// checkbox at ready. ok:false (already so, busy) is logged and,
     /// unless `quiet` (the hook), shown.
     func setSound(_ on: Bool, source: String, quiet: Bool = false) {
+        guard emulatorAllowed() else { return }
         Log.write("sound (\(source)): GET /audio/enable?on=\(on ? 1 : 0)")
         soundItem.isEnabled = false
         server.get("/audio/enable", query: [("on", on ? "1" : "0")], timeout: 30) { [weak self] ok, r, why in
@@ -1825,6 +1925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// location.href and the title are read back and logged: "page kept"
     /// when the interception left the page in place.
     func fireNavHook() {
+        guard emulatorAllowed() else { return }
         let spec = navHook
         navHook = ""
         let go = spec.hasPrefix("go:")
