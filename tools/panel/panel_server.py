@@ -1963,6 +1963,11 @@ class Panel:
             # interpreter, ~0.2x while playing (the fallback, and what an
             # explicit --port-arg=--dsp asks for)
             argv.append("--dsp-rt" if self.rt_wanted else "--dsp")
+        if not self.port_bin.endswith(".py"):
+            # Resolve an explicit park only from metadata bound to this image.
+            # Hardware never constructs Panel; script stand-ins retain their CLI.
+            from port_image import launch_args
+            argv = launch_args(argv)
         return argv
 
     def _boot_port(self, phase=None):

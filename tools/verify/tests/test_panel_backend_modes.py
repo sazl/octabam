@@ -258,3 +258,105 @@ class AudioOutputCloseRace(unittest.TestCase):
             self.assertTrue(p.set_output('off')[0])
         self.assertIsNone(p.output)
         self.assertEqual(output.stops,['stopped: /audio/output?device=off'])
+
+class PortImageLaunch(unittest.TestCase):
+    def panel(self, *, script=False, arguments=()):
+        p = ps.Panel.__new__(ps.Panel)
+        p.port_bin = 'recording.py' if script else 'recording-port'
+        p.image = 'selected-image'; p.card_file = 'selected-card'
+        p.card_rw = True; p.project = ('SET','PROJECT'); p.internal_clock = True
+        p.port_args = list(arguments); p.sound_wanted = True; p.rt_wanted = True
+        return p
+    def test_real_port_validates_complete_effective_launch_after_user_flags(self):
+        calls = []
+        def launch(argv):
+            calls.append(list(argv))
+            return list(argv) + ['--main-park','validated:pair']
+        module = types.SimpleNamespace(launch_args=launch)
+        p = self.panel(arguments=['--mkii','--custom'])
+        with patch.dict(sys.modules, {'port_image':module}):
+            argv = p._port_argv()
+        self.assertEqual(calls, [['recording-port','--image','selected-image','--card','selected-card','--interactive','--card-rw','--mount','--set','SET','--project','PROJECT','--internal-clock','--mkii','--custom','--dsp-rt']])
+        self.assertEqual(argv,calls[0]+['--main-park','validated:pair'])
+        self.assertEqual(p.port_args,['--mkii','--custom'])
+    def test_legacy_python_standin_does_not_load_image_metadata(self):
+        class Forbidden:
+            def __getattr__(self,name):
+                raise AssertionError('standin loaded image metadata')
+        p = self.panel(script=True,arguments=['--dsp'])
+        with patch.dict(sys.modules, {'port_image':Forbidden()}):
+            argv = p._port_argv()
+        self.assertEqual(argv[:2],[sys.executable,'recording.py'])
+        self.assertNotIn('--main-park',argv)
+        self.assertEqual(argv.count('--dsp'),1)
+    def test_explicit_main_park_is_passed_unchanged_to_validation(self):
+        calls = []
+        def launch(argv):
+            calls.append(list(argv)); return list(argv)
+        p = self.panel(arguments=['--main-park','explicit:pair'])
+        with patch.dict(sys.modules, {'port_image':types.SimpleNamespace(launch_args=launch)}):
+            argv = p._port_argv()
+        self.assertEqual(calls,[argv])
+        self.assertEqual(argv[argv.index('--main-park')+1],'explicit:pair')
+    def test_metadata_conflict_prevents_child_creation(self):
+        p = self.panel(arguments=['--main-park','wrong:pair'])
+        p.stop_event = threading.Event(); p.phase = 'booting'
+        def conflict(argv):
+            raise ValueError('main park conflicts with validated image')
+        with patch.dict(sys.modules, {'port_image':types.SimpleNamespace(launch_args=conflict)}), patch.object(ps,'PortProc',side_effect=AssertionError('child spawned despite conflict')):
+            with self.assertRaisesRegex(ValueError,'conflicts with validated image'):
+                p._boot_port()
+    def test_hardware_startup_never_imports_port_image_helper(self):
+        class Forbidden:
+            def __getattr__(self,name):
+                raise AssertionError('hardware loaded image metadata')
+        with patch.dict(sys.modules, {'port_image':Forbidden()}):
+            StartupModes().invoke(['--source=hardware','--port=0'])
+
+class PortImageAssociation(unittest.TestCase):
+    """Caller integration with the real helper and invented ELF/image bytes."""
+    panel = PortImageLaunch.panel
+    def setUp(self):
+        from test_port_image import PortImage
+        import port_image
+        self.fixture = PortImage()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        runtime = self.fixture.root / 'out/platform/runtime/runtime.elf'
+        runtime.parent.mkdir(parents=True)
+        runtime.write_bytes(self.fixture.runtime.read_bytes())
+        (runtime.parent.parent / 'loader.elf').write_bytes((self.fixture.root / 'loader.elf').read_bytes())
+        root = patch.object(port_image, 'ROOT', self.fixture.root)
+        root.start(); self.addCleanup(root.stop)
+    def selected_panel(self, arguments=()):
+        panel = self.panel(arguments=arguments)
+        panel.image = self.fixture.image
+        return panel
+    def pair(self):
+        syms = self.fixture.symbols
+        return f"{syms['mirror_idle_park']:#x}:{syms['mirror_idle_resume']:#x}"
+    def test_current_image_receives_bound_markers_and_equal_override_is_preserved(self):
+        argv = self.selected_panel()._port_argv()
+        self.assertEqual(argv[-2:], ['--main-park',self.pair()])
+        argv = self.selected_panel(['--main-park',self.pair()])._port_argv()
+        self.assertEqual(argv.count('--main-park'),1)
+    def test_conflicting_or_duplicate_effective_options_refuse_launch(self):
+        for arguments in (['--main-park','0x47000012:0x47000000'],
+                          ['--image',str(self.fixture.image)],
+                          ['--main-park=' + self.pair()],
+                          ['--image=' + str(self.fixture.image)]):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                self.selected_panel(arguments)._port_argv()
+    def test_image_loader_mismatch_refuses_launch(self):
+        image = bytearray(self.fixture.image.read_bytes()); image[-1] ^= 1
+        self.fixture.image.write_bytes(image)
+        with self.assertRaisesRegex(ValueError,'loader.*image'):
+            self.selected_panel()._port_argv()
+    def test_stock_image_keeps_existing_arguments_without_elf_metadata(self):
+        image = bytearray(self.fixture.image.read_bytes())
+        image[0x1f896:0x1f89c] = bytes.fromhex('4eb940098a2c')
+        self.fixture.image.write_bytes(image)
+        (self.fixture.root / 'out/platform/runtime/runtime.elf').unlink()
+        argv = self.selected_panel()._port_argv()
+        self.assertNotIn('--main-park',argv)
+        self.assertIn('--mkii',self.selected_panel(['--mkii'])._port_argv())
