@@ -269,4 +269,21 @@ class Control(Snapshot):
         self.uc.mem_write(0xfc07c00c,struct.pack('>I',132000001))
         self.assertEqual(self.request(0x58,value=9)[6],4)
 
+    def test_token_rollover_changes_epoch_and_skips_zero(self):
+        self.feed(b''.join(bytes([0x10|p,c])+bytes(8) for p in range(8) for c in range(0,128,8)))
+        self.put('pm_next_token',0xfffe)
+        last=self.request(0x58,value=7)
+        self.assertEqual(int.from_bytes(last[16:18],'big'),0xffff)
+        self.request(0x5a,value=0xffff)
+        first=self.request(0x58,value=8)
+        self.assertEqual(first[6],1)
+        self.assertEqual(int.from_bytes(first[16:18],'big'),1)
+        self.assertEqual(int.from_bytes(first[8:12],'big'),int.from_bytes(last[8:12],'big')+1)
+        self.assertEqual(self.request(0x59,value=0xffff,length=64)[6],4)
+        self.put('pm_epoch',0xffffffff)
+        self.call('pm_transport_reset')
+        self.assertEqual(self.integer('pm_epoch'),1)
+        self.assertEqual(self.integer('pm_lease_state'),0)
+        self.assertEqual(self.integer('pm_lcd_count'),128)
+
 if __name__=='__main__': unittest.main()
