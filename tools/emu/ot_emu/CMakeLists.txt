@@ -189,3 +189,12 @@ target_compile_definitions(ot_tapeecho_cpu_test PRIVATE TE_HOST=1)
 # -fwrapv makes the oracle wrap the way the target does.
 target_compile_options(ot_tapeecho_cpu_test PRIVATE -fwrapv)
 target_link_libraries(ot_tapeecho_cpu_test PRIVATE ot_machine)
+
+# Synthetic ColdFire programs: real RTOS idle scheduling without stock OS.
+add_executable(ot_main_park_test test_main_park.cpp)
+target_link_libraries(ot_main_park_test PRIVATE ot_machine)
+add_test(NAME main-park COMMAND ot_main_park_test)
+add_test(NAME main-park-exact COMMAND ot_main_park_test)
+set_tests_properties(main-park-exact PROPERTIES ENVIRONMENT "OT_BURST=0")
+
+add_test(NAME main-park-cli COMMAND ot_main_park_test $<TARGET_FILE:ot_emu>)

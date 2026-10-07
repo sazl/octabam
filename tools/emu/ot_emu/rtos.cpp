@@ -288,6 +288,22 @@ namespace ot
 		}
 	}
 
+	bool Rtos::setMainPark(const uint32_t _park, const uint32_t _resume)
+	{
+		if(m_installed || !_park || !_resume || (_park & 1) || (_resume & 1)
+			|| Machine::alias(_park) == Machine::alias(_resume)
+			|| _park >= 0xfc000000u || _resume >= 0xfc000000u
+			|| !m_machine.mapped(_park, 2) || !m_machine.mapped(_resume, 2))
+		{
+			m_why = "main park requires distinct positive even mapped memory PCs before install";
+			return false;
+		}
+		m_mainPark = _park;
+		m_mainResume = _resume;
+		m_spinLo = m_spinHi = 0;
+		return true;
+	}
+
 	void Rtos::install()
 	{
 		// ✅ Check the vectors before trusting any of this: vector 32 (trap #0)
@@ -382,10 +398,30 @@ namespace ot
 		m_intc0.setForceHook([this](uint64_t) { ++m_forces; });
 		m_intc1.setForceHook([this](uint64_t) { ++m_forces; });
 		m_installed = true;
-		if(m_machine.read16(g_mainSpin - 6) == 0x4ef9)		// jmp abs.l: the park is detoured
+		if(!m_mainPark && m_machine.read16(g_mainSpin - 6) == 0x4ef9)
 		{
-			m_spinLo = m_machine.peek32(g_mainSpin - 4);
-			m_spinHi = m_spinLo + 0x80;
+			// Preserve CF METER IDLE's declared legacy behavior, but never
+			// classify an arbitrary JMP target (possibly real work) as idle.
+			// modules/cfmeter-idle/idle.s, assembled for 5475: only the two
+			// relocated data addresses at +8 and +0x2e vary between remixes.
+			static constexpr uint8_t meter[] = {
+				0x4e,0xb9,0x40,0x09,0x8a,0x2c,0x45,0xf9,0,0,0,0,
+				0x24,0x39,0xfc,0x07,0xc0,0x0c,0x2a,0x3c,0x7f,0xff,0xff,0xff,
+				0x2c,0x05,0x20,0x39,0xfc,0x07,0xc0,0x0c,0x22,0x00,0x92,0x82,
+				0x24,0x00,0xb2,0x85,0x64,0x0e,0x2a,0x01,0x23,0xc5,0,0,0,0,
+				0x2c,0x05,0xdc,0x86,0x50,0x86,0xb2,0x86,0x64,0xde,0xd3,0x92,0x60,0xda
+			};
+			const auto target = m_machine.peek32(g_mainSpin - 4);
+			bool match = target && !(target & 1) && target <= UINT32_MAX - 0x80
+				&& m_machine.mapped(target, sizeof meter);
+			for(size_t i = 0; match && i < sizeof meter; ++i)
+				if(!(i >= 8 && i < 12) && !(i >= 0x2e && i < 0x32))
+					match = m_machine.read8(target + static_cast<uint32_t>(i)) == meter[i];
+			if(match)
+			{
+				m_spinLo = target;
+				m_spinHi = target + 0x80;
+			}
 		}
 	}
 
@@ -1024,6 +1060,7 @@ namespace ot
 		const uint32_t pcStop = _s.pcArmed ? _s.pc : 1u;
 		const uint32_t pcLo = _s.pcArmed ? _s.pcLo : 0u, pcHi = _s.pcArmed ? _s.pcHi : 0u;
 		const uint32_t spinLo = m_spinLo, spinHi = m_spinHi;
+		const uint32_t spinPc = m_mainPark ? m_mainPark : g_mainSpin;
 		const bool gateEnds = _s.untilGate;
 		const bool spinEnds = _s.idleSkip;
 		Coprocessor* const co = m_machine.coprocessor();
@@ -1116,6 +1153,10 @@ namespace ot
 					ex = m_sample + c->tickSamples(ex - m_sample);	// a DSP frame edge ends the skip there
 				m_sample = std::max(m_sample, ex);
 				++m_idleSkips;
+				// Resume BEFORE delivering the wake: an interrupt must save
+				// the continuation, so its return cannot strand main at park.
+				if(m_mainPark)
+					m_machine.setPC(m_mainResume);
 				tickTimers();
 				deliver();
 				if(++idleRuns > 1000000)
@@ -1201,7 +1242,7 @@ namespace ot
 					// the spin is executed (the old loop checked before every
 					// instruction) -- after at least one instruction, so a park
 					// with something pending but masked still makes progress.
-					if(spinEnds && i > 0 && (ipc == g_mainSpin || (ipc >= spinLo && ipc < spinHi))) { ++m_burstStats.endSpin; break; }
+					if(spinEnds && i > 0 && (ipc == spinPc || (ipc >= spinLo && ipc < spinHi))) { ++m_burstStats.endSpin; break; }
 					if(ring)
 					{
 						m_pcRing[m_pcRingPos % m_pcRing.size()] = ipc;
@@ -1325,7 +1366,7 @@ namespace ot
 		// the PC at the park IS the condition), no install check (as before).
 		RunSpec s;
 		s.ms = _ms;
-		s.pc = g_mainSpin;
+		s.pc = m_mainPark ? m_mainPark : g_mainSpin;
 		s.pcArmed = true;
 		s.pcLo = m_spinLo; s.pcHi = m_spinHi;
 		s.idleSkip = false;
@@ -1383,28 +1424,29 @@ namespace ot
 		{
 			char msg[160];
 			std::snprintf(msg, sizeof msg, "callAsMain(%#x): pc is %#x, not main's spin %#x",
-				_addr, m_machine.pc(), g_mainSpin);
+				_addr, m_machine.pc(), m_mainPark ? m_mainPark : g_mainSpin);
 			m_why = msg;
 			return false;
 		}
 		// retaddr at [sp], then the args in the order given -- the convention
 		// the firmware's own call sites use (`pea a1; pea a0; jsr addr`).
 		const auto sp = m_machine.getA7() - 4 * static_cast<uint32_t>(1 + _args.size());
-		m_machine.poke32(sp, g_mainSpin);
+		const auto returnPc = m_mainPark ? m_mainResume : g_mainSpin;
+		m_machine.poke32(sp, returnPc);
 		for(size_t i = 0; i < _args.size(); ++i)
 			m_machine.poke32(sp + 4 * static_cast<uint32_t>(i + 1), _args[i]);
 		m_machine.setA7(sp);
 		m_machine.setPC(_addr);
 
-		// O15e: the return is the PC condition (the return address IS the
-		// park), the budget counts instructions as the old loop's `n` did,
+		// O15e: the return is the PC condition (the explicit continuation,
+		// otherwise the stock park); the budget counts the old loop's steps,
 		// no idle skip, no sample end. With the card live the call is
 		// preempted constantly and the bursts run the other tasks' code
 		// underneath it exactly as the plain run would.
 		RunSpec s;
 		s.hasEnd = false;
 		s.budget = _budget;
-		s.pc = g_mainSpin;
+		s.pc = returnPc;
 		s.pcArmed = true;
 		s.idleSkip = false;
 		s.needInstall = false;
