@@ -22,6 +22,11 @@ class Instrument(unittest.TestCase):
         warm=dict(zero,produced=1600,consumed=1550,underruns=100)
         active=dict(zero,produced=3200,consumed=3170,underruns=200)
         gate.check_counter_interval(zero,active,zero,warm,False)
+        # Actual FS matrix case: busy descriptors reduced speculative short
+        # builds; fewer attempts is not a dropped host packet.
+        lower=dict(zero,produced=18336,consumed=18335,underruns=1025)
+        baseline=dict(zero,produced=7056,consumed=7052,underruns=441)
+        gate.check_counter_interval(zero,lower,zero,baseline,False)
         for changed in (dict(active,produced=0),dict(active,underruns=240),dict(active,overruns=1)):
             with self.assertRaises(AssertionError):gate.check_counter_interval(zero,changed,zero,warm,False)
         with self.assertRaises(AssertionError):gate.check_counter_interval(zero,active,zero,warm,True)
@@ -81,6 +86,19 @@ class Instrument(unittest.TestCase):
             for _ in range(120):active.feed(GOOD)
             with self.assertRaises(AssertionError):
                 for _ in range(9):active.feed(bad)
+
+    def test_each_channel_silent_tail_fails_after_good_prefix(self):
+        for channels in (2,20):
+            words=[0x18200000+channel*0x10000 for channel in range(channels)]
+            good=b''.join(word.to_bytes(4,'little') for word in words)*11
+            for silent in range(channels):
+                with self.subTest(channels=channels,silent=silent):
+                    phase=gate.AudioPhase('active',tuple({word} for word in words))
+                    for _ in range(120):phase.feed(good)
+                    bad=b''.join((0 if channel==silent else word).to_bytes(4,'little') for channel,word in enumerate(words))*11
+                    with self.assertRaises(AssertionError):
+                        for _ in range(1000):phase.feed(bad)
+                        phase.finish()
     def test_valid_audio_is_counted_per_phase(self):
         phase=gate.AudioPhase('active',({0x18200000},{0x18210000}),settle=0)
         for _ in range(120):phase.feed(GOOD)

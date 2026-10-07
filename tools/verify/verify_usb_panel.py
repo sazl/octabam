@@ -40,19 +40,20 @@ class AudioPhase:
     """
     def __init__(self,name,expected,settle=0):
         self.name=name;self.expected=expected;self.settle=settle
-        self.polls=0;self.hits=[0]*len(expected);self.blank=0
+        self.polls=0;self.hits=[0]*len(expected);self.blank=[0]*len(expected)
     def feed(self,packet):
         self.polls+=1
         assert len(packet)%(4*len(self.expected))==0,(self.name,'partial audio frame')
         if self.polls<=self.settle:return
         assert packet,(self.name,'empty audio packet')
-        hits=0
+        hits=[0]*len(self.expected)
         for i in range(0,len(packet),4):
             word=int.from_bytes(packet[i:i+4],'little');channel=i//4%len(self.expected)
             assert word==0 or word in self.expected[channel],(self.name,'unexpected audio word',channel,hex(word))
-            if word:self.hits[channel]+=1;hits+=1
-        self.blank=0 if hits else self.blank+1
-        assert self.blank<=8,(self.name,'sustained unidentifiable/silent audio')
+            if word:self.hits[channel]+=1;hits[channel]+=1
+        for channel,count in enumerate(hits):
+            self.blank[channel]=0 if count else self.blank[channel]+1
+            assert self.blank[channel]<=8,(self.name,'sustained unidentifiable/silent channel',channel)
     def finish(self):
         assert min(self.hits)>100,(self.name,'insufficient identifiable audio',self.hits)
         return dict(phase=self.name,polls=self.polls,hits=list(self.hits))
@@ -103,7 +104,9 @@ def check_counter_interval(before,after,baseline_before,baseline_after,hs):
         # interval, not an arbitrary percentage or observed-value whitelist.
         frames=delta['produced']//16;warm_frames=baseline['produced']//16
         assert frames>0 and warm_frames>0 and delta['underruns']>=0,delta
-        difference=abs(delta['underruns']*warm_frames-baseline['underruns']*frames)
+        # An ACTIVE descriptor returns before the insufficient-frame branch,
+        # so fewer speculative failures need not mean a transfer was lost.
+        difference=delta['underruns']*warm_frames-baseline['underruns']*frames
         assert difference<=4*(frames+warm_frames),('FS short-build rate changed',delta,baseline)
     return delta
 
@@ -342,6 +345,8 @@ def run(image, modules, model, hs, out):
             # allow guest software to issue it, then reset before data/status.
             assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x01'
             b.setup(0xc0,0x59,active_identity.token,0,64);stream_service(b,phase.feed)
+            active.update(phase.finish())
+            active['output_counter_window']='through snapshot completion, before READY READ fence'
             b.reset()
             assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x00'
             if ain and hs:assert b.ctrl_in(0x81,0x0a,0,5,1)==b'\x00'

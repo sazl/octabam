@@ -142,12 +142,14 @@ identifiable concurrent audio samples where selected. Warmup, active lease,
 and restart have separate sample counts: warmup cannot satisfy the active
 interval. After bounded settling, empty packets and unexpected nonzero
 samples fail; more than eight consecutive packets without identifiable
-samples fail. Active output counter deltas must advance; HS requires zero
+samples in any one channel fail. Active output counter deltas must advance; HS requires zero
 new underruns/overruns/bank duplicates/reprimes. At FS, the existing counter
 named `underruns` also counts speculative short packet-build attempts:
-compare its rate per 16-sample producer block across settled warmup, active
-lease and restart intervals, allowing four descriptor slots at each
-boundary. Record the raw nonzero values; this is not a physical dropout
+reject an increase in its rate per 16-sample producer block against settled
+warmup for the active lease and restart intervals, allowing four descriptor
+slots at each boundary. Fewer speculative failures are allowed: an ACTIVE
+descriptor returns before that counter's increment. Record the raw nonzero
+values; this bounded modeled tolerance is not a physical dropout
 measurement. Applicable input packet/frame counters must advance without
 bad or partial packets. Input destination routing remains the independent
 input gate's responsibility.
