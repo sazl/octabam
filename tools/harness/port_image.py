@@ -8,15 +8,17 @@ semantics. Stock and other idle owners keep the port's existing behavior.
 
 Call launch_args on the FINAL argv, including user options. The default ELF is
 this checkout's latest runtime, never a guess based on an image filename. An
-external image needs its matching runtime.elf and sibling ../loader.elf; pass
-runtime_elf explicitly. Missing/stale metadata for a DRAM idle hook fails with
-a diagnostic. This proves image association and the small scheduling adapter,
+external image can use its matching runtime.elf and sibling ../loader.elf;
+pass runtime_elf explicitly for strict association. Default discovery leaves
+unknown images unchanged when metadata is unavailable or unrelated. This
+proves image association and the small scheduling adapter,
 not publisher correctness, loader execution, or hardware timing.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import struct
 import sys
 
@@ -120,15 +122,28 @@ def _elf(path):
     return _Elf(base, bytes(raw), symbols, tuple(executable))
 
 
-def _associated_runtime(image, runtime_elf):
+def _associated_runtime(image, runtime_elf, *, required=True):
     try:
-        runtime = _elf(runtime_elf)
         loader = _elf(runtime_elf.parent.parent / 'loader.elf')
     except OSError as exc:
+        if not required:
+            return None
         raise ValueError(f'DRAM idle hook needs matching runtime/loader ELF metadata: {exc}. '
                          'Rebuild this image or pass its runtime_elf to launch_args.') from exc
-    if _slice(image, loader.base - IMAGE_BASE, len(loader.raw)) != loader.raw:
+    offset = loader.base - IMAGE_BASE
+    if offset < 0 or offset + len(loader.raw) > len(image) or image[offset:offset + len(loader.raw)] != loader.raw:
+        if not required:
+            return None
         raise ValueError('linked loader metadata does not match selected image; rebuild/select matching ELFs')
+    try:
+        runtime = _elf(runtime_elf)
+    except OSError as exc:
+        if not required:
+            return None
+        raise ValueError(f'DRAM idle hook needs matching runtime ELF metadata: {exc}') from exc
+    # The metadata now describes the selected loader, not a different build.
+    # Its binding and adapter checks are strict: never swallow these errors
+    # and launch a known candidate with guessed or missing park semantics.
     syms = loader.symbols
     if not {'table', 'octabam_bootstrap'} <= syms.keys():
         raise ValueError('loader ELF metadata lacks platform table/entry')
@@ -169,8 +184,9 @@ def launch_args(argv, *, runtime_elf=None):
     """Return validated port argv; leave explicit matching markers untouched.
 
     A known marker conflict fails before spawning. Feature-absent/stock
-    images receive no new arguments. Unknown image-resident idle code gets
-    no inferred park; the emulator executes it normally.
+    images receive no new arguments. Default metadata discovery is best
+    effort for unknown images; an explicit runtime_elf requires association.
+    No inferred park is supplied without a fully validated mirror adapter.
     """
     args = list(argv)
     image_path = _one_option(args, '--image')
@@ -183,7 +199,9 @@ def launch_args(argv, *, runtime_elf=None):
             fields = explicit.split(':')
             if len(fields) != 2:
                 raise ValueError()
-            pair = tuple(int(s, 0) for s in fields)
+            if not all(re.fullmatch(r'(?:[0-9]+|0[xX][0-9a-fA-F]+)', s) for s in fields):
+                raise ValueError()
+            pair = tuple(int(s, 16 if s.lower().startswith('0x') else 10) for s in fields)
             if any(v <= 0 or v > 0xffffffff or v & 1 for v in pair) or pair[0] == pair[1]:
                 raise ValueError()
         except (ValueError, AttributeError) as exc:
@@ -195,7 +213,10 @@ def launch_args(argv, *, runtime_elf=None):
     target = int.from_bytes(hook[2:], 'big')
     if IMAGE_BASE <= target < IMAGE_BASE + len(image):
         return args
-    runtime = _associated_runtime(image, Path(runtime_elf) if runtime_elf is not None else ROOT / 'out/platform/runtime/runtime.elf')
+    runtime = _associated_runtime(image, Path(runtime_elf) if runtime_elf is not None else ROOT / 'out/platform/runtime/runtime.elf',
+                                  required=runtime_elf is not None)
+    if runtime is None:
+        return args
     names = {'pm_idle_entry', 'mirror_idle_park', 'mirror_idle_resume', 'pm_publish', 'pm_live'}
     present = names & runtime.symbols.keys()
     if not present:

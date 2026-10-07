@@ -66,6 +66,49 @@ class PortImage(unittest.TestCase):
     def launch(self, args=None):
         return port_image.launch_args(self.argv if args is None else args, runtime_elf=self.runtime)
 
+    def install_default_metadata(self):
+        selected = self.root / 'out/platform/runtime/runtime.elf'
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        selected.write_bytes(self.runtime.read_bytes())
+        (selected.parent.parent / 'loader.elf').write_bytes((self.root / 'loader.elf').read_bytes())
+
+    def test_unknown_dram_image_preserves_argv_with_missing_or_stale_default_metadata(self):
+        # Keep a different build's mirror metadata beside an archived image.
+        self.install_default_metadata()
+        self.symbols = {'another_idle': self.base}
+        self.raw += b'\x4e\x71'
+        self.write_fixture()
+        for metadata_root in (self.root / 'missing', self.root):
+            for extra in ([], ['--main-park', '0x47000012:0x4700000e']):
+                args = self.argv + extra
+                with self.subTest(metadata=metadata_root, extra=extra), patch.object(port_image, 'ROOT', metadata_root):
+                    self.assertEqual(port_image.launch_args(args), args)
+
+    def test_associated_default_mirror_keeps_strict_validation(self):
+        self.install_default_metadata()
+        with patch.object(port_image, 'ROOT', self.root):
+            self.assertEqual(port_image.launch_args(self.argv)[-2:], ['--main-park', '0x47000012:0x4700000e'])
+            with self.assertRaisesRegex(ValueError, 'conflict'):
+                port_image.launch_args(self.argv + ['--main-park', '0x47000012:0x47000000'])
+            selected = self.root / 'out/platform/runtime/runtime.elf'
+            selected.write_bytes(elf(self.base, self.raw + b'\x01', self.symbols))
+            with self.assertRaisesRegex(ValueError, 'runtime.*payload'):
+                port_image.launch_args(self.argv)
+            self.raw = self.raw[:18] + b'\x4e\x71' + self.raw[20:]
+            self.write_fixture()
+            self.install_default_metadata()
+            with self.assertRaisesRegex(ValueError, 'branch'):
+                port_image.launch_args(self.argv)
+
+    def test_native_unsigned_number_grammar_and_leading_zero_decimal(self):
+        for pair in ('01191182354:01191182350', '0X47000012:0X4700000e'):
+            args = self.argv + ['--main-park', pair]
+            self.assertEqual(self.launch(args), args)
+        for pair in ('+2:4', ' 2:4', '2_0:4', '0b10:4', '0o2:4',
+                     '٢:4', '-2:4', '0x:4', '4294967296:4', '3:4'):
+            with self.subTest(pair=pair), self.assertRaisesRegex(ValueError, 'invalid --main-park'):
+                self.launch(self.argv + ['--main-park', pair])
+
     def test_matching_image_gets_exact_branch_markers_without_mutating_argv(self):
         result = self.launch()
         self.assertEqual(result, self.argv + ['--main-park', '0x47000012:0x4700000e'])
