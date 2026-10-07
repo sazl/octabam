@@ -1,7 +1,10 @@
 """Firmware-free falsification of the final-image verifier's own oracles."""
 import os
+import concurrent.futures
 import pathlib
 import struct
+import socket
+import threading
 import sys
 import tempfile
 import types
@@ -16,6 +19,81 @@ LCD=b''.join(bytes([0x10|p,c])+bytes([p+1])*8 for p in range(8) for c in range(0
 GOOD=(0x18200000).to_bytes(4,'little')+(0x18210000).to_bytes(4,'little')
 
 class Instrument(unittest.TestCase):
+    def test_dispatcher_routes_interleaved_endpoint_and_call_replies(self):
+        client,server=socket.socketpair()
+        mux=gate.ConcurrentBench(types.SimpleNamespace(sock=client,buf=b'',timeout=1))
+        self.addCleanup(mux.close);self.addCleanup(server.close)
+        def respond():
+            data=b''
+            while data.count(b'\n')<4:data+=server.recv(4096)
+            server.sendall(b'out 3 4\nin 0 aa\ncall 0x17\nin 3 bb\n')
+        thread=threading.Thread(target=respond);thread.start()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            jobs=[pool.submit(mux.ep_in,0,64),pool.submit(mux.ep_in,3,1024),pool.submit(mux.ep_out,3,bytes(4)),pool.submit(mux.call,0x40010b00)]
+            self.assertEqual([job.result() for job in jobs],[b'\xaa',b'\xbb',4,23])
+        thread.join(1);self.assertFalse(thread.is_alive())
+        mux.close();self.assertFalse(mux.reader.is_alive())
+
+    def test_borrowed_call_serializes_pokes_but_not_iso(self):
+        client,server=socket.socketpair()
+        mux=gate.ConcurrentBench(types.SimpleNamespace(sock=client,buf=b'',timeout=1))
+        self.addCleanup(mux.close);self.addCleanup(server.close)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            call=pool.submit(mux.call,0x40010b00)
+            self.assertEqual(server.recv(4096),b'call 0x40010b00\n')
+            # Marker refresh must skip a held borrowed-call slot instead of
+            # preventing the ISO token needed for that call to complete.
+            mux.try_pokes(((0x80000000,b'xx'),))
+            poll=pool.submit(mux.ep_in,3,64)
+            self.assertEqual(server.recv(4096),b'in 3 64\n')
+            with self.assertRaisesRegex(AssertionError,'duplicate pending'):
+                mux.ep_in(3,64)
+            server.sendall(b'in 3 aa\ncall 0\n')
+            self.assertEqual(poll.result(),b'\xaa');self.assertEqual(call.result(),0)
+            poke=pool.submit(mux.poke,0x80000000,b'xx')
+            self.assertEqual(server.recv(4096),b'poke 0x80000000 7878\n')
+            server.sendall(b'poke ok\n');poke.result()
+
+    def test_iso_continuous_phase_is_bounded(self):
+        calls=[]
+        worker=gate.IsoWorker(lambda:calls.append(1))
+        try:
+            worker.resume()
+            with self.assertRaisesRegex(RuntimeError,'4096'):
+                worker.wait_paused()
+            self.assertEqual(len(calls),4096)
+        finally:worker.close()
+
+    def test_dispatcher_timeout_error_and_close_wake_waiters(self):
+        for failure in ('timeout','error','close'):
+            with self.subTest(failure=failure):
+                client,server=socket.socketpair()
+                mux=gate.ConcurrentBench(types.SimpleNamespace(sock=client,buf=b'',timeout=.1))
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        job=pool.submit(mux.ep_in,0,64)
+                        server.recv(4096)
+                        if failure=='error':server.sendall(b'err deliberate\n')
+                        elif failure=='close':mux.close()
+                        with self.assertRaises((RuntimeError,TimeoutError)):job.result(timeout=1)
+                finally:mux.close();server.close()
+                self.assertFalse(mux.reader.is_alive())
+
+    def test_iso_worker_has_exact_phase_barriers_and_propagates_failure(self):
+        phase=gate.AudioPhase('warm',({0x18200000},{0x18210000}))
+        worker=gate.IsoWorker(lambda:phase.feed(GOOD))
+        try:
+            worker.run(80);self.assertEqual(phase.polls,80)
+            phase=gate.AudioPhase('active',({0x18200000},{0x18210000}))
+            worker.run(160);self.assertEqual(phase.polls,160)
+            self.assertEqual(phase.finish()['hits'],[160,160])
+        finally:worker.close()
+        self.assertFalse(worker.thread.is_alive())
+        bad=gate.IsoWorker(lambda:(_ for _ in ()).throw(RuntimeError('deliberate ISO failure')))
+        try:
+            with self.assertRaisesRegex(RuntimeError,'deliberate'):bad.run(1)
+        finally:bad.close()
+
     def test_counter_progress_and_fs_short_build_baseline(self):
         names=('produced','consumed','underruns','overruns','bankdup','reprimes')
         zero=dict.fromkeys(names,0)

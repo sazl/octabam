@@ -7,16 +7,20 @@ Instruction/transfer correctness is not a hardware timing or audio proof.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
 import pathlib
+import queue
 import re
 import runpy
 import shutil
+import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -28,6 +32,125 @@ import usb_host  # noqa: E402
 import usb_mirror_protocol as wire  # noqa: E402
 from panel_link import PanelLink  # noqa: E402
 from verify_usb import LAYOUTS, RB_BASE, MAIN_CUE_BASE, TAP_RB, TAP_MC, tap_word  # noqa: E402
+
+
+class ConcurrentBench(usb_host.Bench):
+    """One bounded reader for concurrent commands on the emulated socket.
+
+    One request per exact response prefix; no unsolicited reply queue. The
+    port has only one borrowed poke/call slot, so serialize those together.
+    This is never a physical USB transport.
+    """
+    def __init__(self,base):
+        self.sock=base.sock;self.timeout=base.timeout;self.buf=base.buf
+        self.pending={};self.lock=threading.Lock();self.send_lock=threading.Lock()
+        self.bench_lock=threading.RLock();self.error=None;self.closed=False
+        self.sock.settimeout(.2)
+        self.reader=threading.Thread(target=self._read,name='panel-bench-reader',daemon=True)
+        self.reader.start()
+    def _fail(self,error):
+        with self.lock:
+            if self.error is None:self.error=error
+            for reply in self.pending.values():
+                try:reply.put_nowait(self.error)
+                except queue.Full:pass
+    def _read(self):
+        try:
+            while not self.closed:
+                if b'\n' not in self.buf:
+                    try:data=self.sock.recv(65536)
+                    except socket.timeout:continue
+                    if not data:raise RuntimeError('bench closed the socket')
+                    self.buf+=data
+                    if len(self.buf)>65536:raise RuntimeError('bench response exceeded bound')
+                    continue
+                line,self.buf=self.buf.split(b'\n',1);line=line.decode()
+                parts=line.split()
+                if not parts or parts[0]=='err':raise RuntimeError('bench: '+line)
+                prefix=' '.join(parts[:2]) if parts[0] in ('in','out') else parts[0]
+                with self.lock:
+                    reply=self.pending.get(prefix)
+                    if reply is None:raise RuntimeError('unsolicited bench reply: '+line)
+                    reply.put_nowait(line)
+        except BaseException as exc:self._fail(exc)
+    def cmd(self,line,expect=None,timeout=None):
+        prefix=expect or line.split()[0]
+        assert prefix in {'ok','poke','call',*(f'{direction} {ep}' for direction in ('in','out') for ep in range(4))},prefix
+        guard=self.bench_lock if line.split()[0] in ('poke','call') else contextlib.nullcontext()
+        with guard:
+            reply=queue.Queue(maxsize=1)
+            with self.lock:
+                if self.error is not None:raise self.error
+                assert prefix not in self.pending,('duplicate pending response prefix',prefix)
+                self.pending[prefix]=reply
+            try:
+                with self.send_lock:self.sock.sendall(line.encode()+b'\n')
+                try:result=reply.get(timeout=timeout or self.timeout)
+                except queue.Empty:
+                    error=TimeoutError('no concurrent bench reply for '+prefix)
+                    self._fail(error);raise error
+                if isinstance(result,BaseException):raise result
+                return result
+            finally:
+                with self.lock:self.pending.pop(prefix,None)
+    def try_pokes(self,items):
+        # A pending borrowed call needs ISO polls to reach main; never block
+        # the ISO worker behind that call just to refresh synthetic markers.
+        if not self.bench_lock.acquire(blocking=False):return
+        try:
+            for address,data in items:self.poke(address,data)
+        finally:self.bench_lock.release()
+    def close(self):
+        if self.closed:return
+        self.closed=True;self._fail(RuntimeError('concurrent bench closed'))
+        try:self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:pass
+        self.sock.close();self.reader.join(timeout=2)
+        assert not self.reader.is_alive(),'bench reader did not stop'
+
+
+class IsoWorker:
+    """Bounded ISO work with exact stopped phase boundaries and joined exit."""
+    def __init__(self,operation,timeout=30):
+        self.operation=operation;self.timeout=timeout;self.cv=threading.Condition()
+        self.paused=True;self.stop=False;self.pause_requested=False;self.error=None
+        self.remaining=0;self.finite=True
+        self.thread=threading.Thread(target=self._run,name='panel-iso',daemon=True);self.thread.start()
+    def _run(self):
+        try:
+            while True:
+                with self.cv:
+                    self.cv.wait_for(lambda:not self.paused or self.stop)
+                    if self.stop:return
+                self.operation()
+                with self.cv:
+                    self.remaining-=1
+                    if self.remaining==0 and not self.finite:raise RuntimeError('ISO phase exceeded4096poll budget')
+                    if self.pause_requested or self.remaining==0:self.paused=True;self.cv.notify_all()
+        except BaseException as exc:
+            with self.cv:self.error=exc;self.paused=True;self.cv.notify_all()
+    def check(self):
+        with self.cv:
+            if self.error is not None:raise self.error
+    def resume(self,polls=None):
+        with self.cv:
+            if self.error is not None:raise self.error
+            assert self.paused and not self.stop
+            assert polls is None or 0<polls<=4096
+            self.remaining=polls or 4096;self.finite=polls is not None
+            self.pause_requested=False;self.paused=False;self.cv.notify_all()
+    def wait_paused(self):
+        with self.cv:
+            if not self.cv.wait_for(lambda:self.paused or self.error is not None,timeout=self.timeout):raise TimeoutError('ISO phase barrier timed out')
+            if self.error is not None:raise self.error
+    def pause(self):
+        with self.cv:self.pause_requested=True
+        self.wait_paused()
+    def run(self,polls):self.resume(polls);self.wait_paused()
+    def close(self):
+        with self.cv:self.stop=True;self.cv.notify_all()
+        self.thread.join(timeout=2)
+        assert not self.thread.is_alive(),'ISO worker did not stop'
 
 
 class AudioPhase:
@@ -199,7 +322,7 @@ def run(image, modules, model, hs, out):
           '--panel-tx',str(uart),'--rtc','off','--card',str(card),'--live-script',str(script),'--mem-dump',memory]
     if model=='mkii':args+=['--mkii']
     if audio:args+=['--frame']
-    expected_stalls=0; b=None; last_body=None; descriptions={}
+    expected_stalls=0; b=None; pump=None; last_body=None; descriptions={}
     with log.open('w') as lf:
         emu=subprocess.Popen(args,stdout=lf,stderr=subprocess.STDOUT,cwd=ROOT)
     def request(op,value=0,index=0,length=32):
@@ -282,6 +405,7 @@ def run(image, modules, model, hs, out):
         last_body,changed=snapshot(0x12340003)
         assert changed.generation>again.generation and last_body!=first
         if audio:
+            b=ConcurrentBench(b)
             nch,_,bint,taps=LAYOUTS[audio]
             # Controlled synthetic source fixture, not an operator project.
             # Stock 40003510/1c tests this two-bank selector against7; that
@@ -306,33 +430,39 @@ def run(image, modules, model, hs, out):
             phase=AudioPhase('warmup',expected,settle=80)
             controls_done=False
             def input_counters():return struct.unpack('>15I',b.ctrl_in(0xc0,0x56,0,0,60))
+            def poll_one():
+                nonlocal input_frame
+                b.try_pokes(((RB_BASE,rb),(MAIN_CUE_BASE,TAP_MC)))
+                packet=b.ep_in(3,1024);phase.feed(packet)
+                if ain and hs:
+                    n=len(packet)//(4*nch)
+                    payload=b''.join(struct.pack('<I',(((ch<<20)|((input_frame+j)&0xfffff))<<8)) for j in range(n) for ch in range(in_channels))
+                    assert b.ep_out(3,payload)==len(payload);input_frame+=n
+            pump=IsoWorker(poll_one)
             def concurrent():
-                nonlocal input_frame,midi_during_mirror,controls_done,expected_stalls
+                nonlocal midi_during_mirror,controls_done,expected_stalls
+                pump.check()
                 if mirror_phase and not midi_during_mirror:
                     usb_host.midi_send(b,bytes.fromhex('904163f8'))
                     assert b'\x09'+midi in b.ep_in(2,512)
                     midi_during_mirror=True
                 if mirror_phase and not controls_done:
-                    expected_stalls+=uac2_during_lease(b,request,0x12340004,lambda:stream_service(b,phase.feed))
+                    expected_stalls+=uac2_during_lease(b,request,0x12340004)
                     controls_done=True
-                for _ in range(8):
-                    b.poke(RB_BASE,rb);b.poke(MAIN_CUE_BASE,TAP_MC)
-                    packet=b.ep_in(3,1024);phase.feed(packet)
-                    if ain and hs:
-                        n=len(packet)//(4*nch)
-                        payload=b''.join(struct.pack('<I',(((ch<<20)|((input_frame+j)&0xfffff))<<8)) for j in range(n) for ch in range(in_channels))
-                        assert b.ep_out(3,payload)==len(payload);input_frame+=n
-            for _ in range(10):concurrent()
+            pump.run(80)
             baseline_before=usb_host.counters(b)
-            for _ in range(20):concurrent()
+            pump.run(160)
             before=usb_host.counters(b);before_in=input_counters() if ain and hs else None
             baseline_after=before
             warm=phase.finish()
             warm['output_delta']=check_counter_interval(baseline_before,before,baseline_before,before,hs)
             audio_evidence.append(warm)
+            lease=request(0x58,0x0004,0x1234)
+            assert lease.header.status in (wire.Status.PENDING,wire.Status.OK)
             phase=AudioPhase('active lease',expected)
-            mirror_phase=True
+            mirror_phase=True;pump.resume()
             last_body,active_identity=snapshot(0x12340004,concurrent,release=False)
+            pump.pause()
             assert midi_during_mirror and controls_done
             active=phase.finish();after=usb_host.counters(b)
             active['output_delta']=check_counter_interval(before,after,baseline_before,baseline_after,hs)
@@ -343,8 +473,10 @@ def run(image, modules, model, hs, out):
             audio_evidence.append(active)
             # The body is READY and streams are still alt1. Prime a real READ,
             # allow guest software to issue it, then reset before data/status.
+            pump.resume()
             assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x01'
-            b.setup(0xc0,0x59,active_identity.token,0,64);stream_service(b,phase.feed)
+            b.setup(0xc0,0x59,active_identity.token,0,64);b.call(0x40010b00,timeout=10)
+            pump.pause()
             active.update(phase.finish())
             active['output_counter_window']='through snapshot completion, before READY READ fence'
             b.reset()
@@ -360,9 +492,9 @@ def run(image, modules, model, hs, out):
             if ain and hs:b.ctrl_nodata(0x01,0x0b,1,5)
             mirror_phase=False
             phase=AudioPhase('after reset/restart',expected,settle=80)
-            for _ in range(10):concurrent()
+            pump.run(80)
             restart_before=usb_host.counters(b)
-            for _ in range(20):concurrent()
+            pump.run(160)
             restart=phase.finish()
             restart['output_delta']=check_counter_interval(restart_before,usb_host.counters(b),baseline_before,baseline_after,hs)
             audio_evidence.append(restart)
@@ -370,6 +502,7 @@ def run(image, modules, model, hs, out):
             b.ctrl_nodata(0x01,0x0b,0,4)
             for _ in range(8):b.ep_in(3,1024)
             assert b.ctrl_in(0x81,0x0a,0,4,1)==b'\x00'
+            pump.close();pump=None
             print(f'  [PASS] {tag}: separate warm/active/restart audio intervals {audio_evidence}; input={ain if hs else None}',flush=True)
         # MIDI runs on its ordinary endpoints alongside the frozen protocol.
         usb_host.midi_send(b,bytes.fromhex('903c64b03c40'))
@@ -385,10 +518,14 @@ def run(image, modules, model, hs, out):
         assert request(0x57,length=64).header.epoch!=old_epoch
         assert request(0x59,pending.header.token,0,64).header.status==wire.Status.STALE
         last_body,last_identity=snapshot(0x12340005)
-        b.sock.close();b=None
+        if isinstance(b,ConcurrentBench):b.close()
+        else:b.sock.close()
+        b=None
         assert emu.wait(timeout=30)==0,'port did not exit cleanly'
     finally:
-        if b is not None:b.sock.close()
+        if isinstance(b,ConcurrentBench):b.close()
+        elif b is not None:b.sock.close()
+        if pump is not None:pump.close()
         if emu.poll() is None:emu.terminate();emu.wait(timeout=10)
     raw_uart=uart.read_bytes()
     oracle=PanelLink();oracle.feed(raw_uart)
