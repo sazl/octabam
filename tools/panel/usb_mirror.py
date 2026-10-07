@@ -285,8 +285,10 @@ class SnapshotClient:
                     raise TransportError('closed','Snapshot cancelled after final READ')
                 try: body,summary=assembler.finish()
                 except p.ProtocolError as error: raise TransportError('protocol_error',str(error)) from error
-                return CompletedSnapshot(identity,info,body,summary)
-            raise TransportError('timeout','Pending acquisition retry limit exceeded')
+                completed=CompletedSnapshot(identity,info,body,summary)
+                break
+            else:
+                raise TransportError('timeout','Pending acquisition retry limit exceeded')
         except BaseException as error:
             primary=error
             unavailable=isinstance(error,TransportError) and error.code in ('disconnected','closed')
@@ -305,3 +307,6 @@ class SnapshotClient:
                 except Exception:
                     if primary is None: raise
                     _LOG.debug('Best-effort bounded RELEASE failed after acquisition error',exc_info=True)
+        if stop_event is not None and stop_event.is_set():
+            raise TransportError('closed','Snapshot cancelled during RELEASE')
+        return completed

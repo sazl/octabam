@@ -173,6 +173,20 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(cm.exception.code,'closed')
         self.assertEqual(transport.requests[-1].request,0x5a)
 
+    def test_cancel_during_release_does_not_return_candidate(self):
+        event=threading.Event()
+        class CancelTransport(FakeTransport):
+            def exchange(self,req,**kwargs):
+                raw=super().exchange(req,**kwargs)
+                if req.request==0x5a: event.set()
+                return raw
+        transport=CancelTransport(); client=m.SnapshotClient(transport,connection_id=3)
+        with self.assertRaises(m.TransportError) as cm:
+            client.snapshot(*client.info(),stop_event=event)
+        self.assertEqual(cm.exception.code,'closed')
+        self.assertEqual([req.request for req in transport.requests].count(0x5a),1)
+        self.assertEqual(transport.requests[-1].request,0x5a)
+
     def test_late_final_response_is_not_published(self):
         clock=[10.0]
         class LateTransport(FakeTransport):
