@@ -111,5 +111,36 @@
     "level_base": 48,
     "backlight_opcode": 183,
     "crc_algorithm": "CRC-32/ISO-HDLC"
+  },
+  "header_widths": {
+    "magic": 4,
+    "major": 1,
+    "minor": 1,
+    "status": 1,
+    "kind": 1,
+    "epoch": 4,
+    "generation": 4,
+    "token": 2,
+    "total_length": 2,
+    "offset": 2,
+    "payload_length": 2,
+    "crc32": 4,
+    "flags": 4
+  },
+  "info_widths": {
+    "schema": 1,
+    "model": 1,
+    "width": 2,
+    "height": 2,
+    "pages": 1,
+    "block_columns": 1,
+    "max_response": 2,
+    "max_snapshot": 2,
+    "min_poll_ms": 2,
+    "valid_lcd_blocks": 2,
+    "lease_ms": 2,
+    "max_publications_hz": 2,
+    "build_id_length": 1,
+    "build_id": 11
   }
 }

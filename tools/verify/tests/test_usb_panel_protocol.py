@@ -1,5 +1,6 @@
 """Independent wire vectors for the provisional mirror protocol (no firmware bytes)."""
 import dataclasses
+import copy
 import pathlib
 import struct
 import unittest
@@ -45,6 +46,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(p.info_request(), p.SetupRequest(0xc0,0x57,0,0,64))
         self.assertEqual(p.begin_request(0x10203040), p.SetupRequest(0xc0,0x58,0x3040,0x1020,32))
         with self.assertRaises(dataclasses.FrozenInstanceError): r.header.epoch = 2
+
+    def test_definition_rejects_same_size_field_offset_swaps(self):
+        for section, first, second in (('header_offsets','token','total_length'),
+                                        ('header_offsets','epoch','generation'),
+                                        ('info_offsets','width','height'),
+                                        ('info_offsets','lease_ms','max_publications_hz')):
+            definition=copy.deepcopy(p.DEFINITION)
+            fields=definition[section]
+            fields[first],fields[second]=fields[second],fields[first]
+            with self.subTest(section=section,first=first),self.assertRaises(p.ProtocolError):
+                p.validate_definition(definition)
+        p.validate_definition(p.DEFINITION)
 
     def test_crc_vectors(self):
         for data, crc in ((b'',0),(b'123456789',0xcbf43926),(bytes(range(256)),0x29058c73)):

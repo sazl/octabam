@@ -3,9 +3,10 @@
 The definition and generated include are design artifacts; they do not establish
 firmware availability, model identity, DMA safety or audio coexistence.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import IntEnum
 import json
+import re
 from pathlib import Path
 import struct
 import zlib
@@ -95,12 +96,42 @@ class BodySummary:
     backlight_known: bool
 
 
+def validate_definition(definition) -> None:
+    """Check every assembly offset/width against the actual host struct layout.
+
+    Names follow the public dataclass API, not JSON object insertion order. This
+    detects equal-width field swaps even after protocol.inc has been regenerated.
+    """
+    header_names=('magic',)+tuple(field.name for field in fields(Header))
+    info_names=tuple(field.name for field in fields(Info))[:-2]+('build_id_length','build_id')
+    for section,names in (('header',header_names),('info',info_names)):
+        fmt=definition[section+'_struct']
+        if not fmt.startswith('>'):
+            raise ProtocolError('wire layout must be big-endian')
+        tokens=re.findall(r'[0-9]*[sBHI]',fmt[1:])
+        if ''.join(tokens)!=fmt[1:] or len(tokens)!=len(names):
+            raise ProtocolError('wire layout field count/type mismatch')
+        offset=0; offsets={}; widths={}
+        for name,token in zip(names,tokens):
+            offsets[name]=offset; widths[name]=struct.calcsize('>'+token)
+            offset+=widths[name]
+        if offsets!=definition[section+'_offsets'] or widths!=definition[section+'_widths']:
+            raise ProtocolError(f'{section} assembly offset/width differs from host struct')
+        if offset!=definition['constants'][section.upper()+'_SIZE']:
+            raise ProtocolError(f'{section} size differs from field layout')
+
+
+validate_definition(DEFINITION)
+
+
 def generate_assembly_include() -> str:
     """Deterministic GNU-as constants, always derived from protocol.json."""
+    validate_definition(DEFINITION)
     lines = ['/* Generated from protocol.json; PROVISIONAL: not deployed firmware. */']
     for section, prefix in (('constants',''),('flags',''),('statuses','STATUS_'),
                             ('operations','KIND_'),('models','MODEL_'),
-                            ('header_offsets','HEADER_OFFSET_'),('info_offsets','INFO_OFFSET_')):
+                            ('header_offsets','HEADER_OFFSET_'),('info_offsets','INFO_OFFSET_'),
+                            ('header_widths','HEADER_WIDTH_'),('info_widths','INFO_WIDTH_')):
         for key, value in DEFINITION[section].items():
             lines.append(f'.equ OTPM_{prefix}{key.upper()}, 0x{value:x}')
     lines.append(f'.equ OTPM_MAGIC, 0x{int.from_bytes(MAGIC, "big"):x}')
