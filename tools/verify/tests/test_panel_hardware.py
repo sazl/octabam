@@ -213,6 +213,24 @@ assert script_worker.ViewSnapshot is panel_backend.ViewSnapshot
         self.assertEqual(status["last_snapshot_at"], view.snapshot_at)
         self.assertEqual(status["last_display_change_at"], view.display_changed_at)
 
+    def test_instance_identity_is_stable_and_distinguishes_backend_lifetimes(self):
+        # Publication wall time is not a lifecycle identity, even if clocks repeat.
+        with patch.object(self.h.time, 'time', return_value=1234567890.0):
+            first, transport, _ = self.start()
+            view = self.live(first)
+            identity = first.status()['instance_id']
+            self.assertTrue(identity)
+            self.wait_for(lambda: len(transport.calls_for(p.REQUEST_INFO)) >= 4)
+            self.assertEqual(first.status()['instance_id'], identity)
+            self.assertEqual(first.status()['seq'], view.generation)
+            self.assertEqual(first.status()['last_snapshot_at'], view.snapshot_at)
+            first.close()
+            second, _, _ = self.start()
+            restarted = self.live(second)
+            self.assertEqual(restarted.generation, view.generation)
+            self.assertEqual(restarted.snapshot_at, view.snapshot_at)
+            self.assertNotEqual(second.status()['instance_id'], identity)
+
     def test_device_contact_timeout_is_visible_and_browser_reads_cannot_refresh_it(self):
         with patch.object(self.h, "CONTACT_TIMEOUT_S", 0.05):
             backend, transport, _ = self.start()

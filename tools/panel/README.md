@@ -47,6 +47,12 @@ restart explicitly after disconnect to adopt a device; topology is a location,
 not unit identity. Ctrl-C cancels the worker and closes the server. Five polls
 per second is the default, not evidence of ten visible updates per second.
 Physical latency/audio headroom and Windows driver coexistence are unmeasured.
+Hardware status identifies each published frame by `(instance_id, seq)`;
+`instance_id` changes with each backend lifetime. The browser keeps the last
+decoded pixels while a new PNG loads, labels failures or pending images as
+stale/waiting, and retries failed images on later status polls at most once per
+second with a five-second request deadline. Late responses cannot overwrite a
+newer publication or a different source.
 
 The encoded-EP0 integration test uses the real SnapshotClient, HardwareBackend
 and HTTP handler, including shared HTTP/SSE viewers and reconnect recovery.

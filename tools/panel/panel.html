@@ -362,7 +362,12 @@ function sourceStatus(s) {
   const readOnly = !port || s.read_only === true;
   const identified = port ? "port" : hardware ? "hardware" : null;
   const changed = source !== identified || before !== after || sourceReadOnly !== readOnly;
-  if (source !== identified) { lastSeq = -1; hasVerifiedFrame = false; }
+  if (source !== identified) {
+    lastSeq = -1; hasVerifiedFrame = false;
+    cancelPhysicalImage(); physicalImage.wanted = null; physicalImage.status = null;
+    physicalImage.failed = false; physicalImage.retryAt = 0;
+  }
+  if (!hardware || !caps.includes("screen")) cancelPhysicalImage();
   sourceReadOnly = readOnly; source = identified; capabilities = new Set(caps);
   if (changed || !can("controls")) cancelControls();
   if (!can("audio")) {
@@ -1505,6 +1510,39 @@ function startLedStream() {
 
 // ---------------- status poll ----------------
 let lastSeq = -1, lastFault = null;
+const physicalImage = {pending:null, wanted:null, status:null, failed:false, retryAt:0};
+function cancelPhysicalImage() {
+  const load = physicalImage.pending;
+  if (!load) return;
+  physicalImage.pending = null;
+  clearTimeout(load.timer);
+  load.image.onload = load.image.onerror = null;
+  load.image.removeAttribute("src");
+}
+function loadPhysicalImage(key, status) {
+  // Decode separately so a failed/slow response never replaces verified pixels.
+  const image = new Image(), previous = $("#screen");
+  for (const attr of previous.attributes) if (attr.name !== "src") image.setAttribute(attr.name, attr.value);
+  const load = {image, timer:null};
+  physicalImage.pending = load;
+  const failed = () => {
+    if (physicalImage.pending !== load) return;
+    cancelPhysicalImage();
+    physicalImage.failed = true; physicalImage.retryAt = Date.now() + 1000;
+    renderPhysicalStatus(physicalImage.status);
+  };
+  image.onerror = failed;
+  image.onload = () => {
+    if (physicalImage.pending !== load || source !== "hardware" || !can("screen")) return;
+    clearTimeout(load.timer); physicalImage.pending = null;
+    image.onload = image.onerror = null;
+    $("#screen").replaceWith(image);
+    lastSeq = key; hasVerifiedFrame = true; physicalImage.failed = false;
+    renderPhysicalStatus(physicalImage.status);
+  };
+  load.timer = setTimeout(failed, 5000);
+  image.src = `/screen.png?instance=${encodeURIComponent(status.instance_id)}&seq=${status.seq}`;
+}
 async function poll() {
   try {
     const s = await panelFetch("/status").then(x => x.json());
@@ -1546,7 +1584,19 @@ async function poll() {
 let pollN = 0;
 
 function renderPhysicalStatus(s) {
-  const hardware = source === "hardware", state = hardware ? (s.connection_state || "connecting") : "unsupported";
+  const hardware = source === "hardware", deviceState = hardware ? (s.connection_state || "connecting") : "unsupported";
+  const frame = hardware && s.has_frame === true;
+  const key = frame && typeof s.instance_id === "string" && s.instance_id && Number.isInteger(s.seq)
+    ? JSON.stringify([s.instance_id, s.seq]) : null;
+  physicalImage.status = s;
+  if (key !== physicalImage.wanted) {
+    cancelPhysicalImage(); physicalImage.wanted = key;
+    physicalImage.failed = false; physicalImage.retryAt = 0;
+  }
+  if (key != null && can("screen") && key !== lastSeq && !physicalImage.pending && Date.now() >= physicalImage.retryAt)
+    loadPhysicalImage(key, s);
+  const current = key != null && key === lastSeq;
+  const state = deviceState === "live" && !current ? (physicalImage.failed ? "image unavailable" : "syncing") : deviceState;
   const identity = s.device || {}, protocol = s.protocol || {};
   const device = identity.serial || identity.selector || identity.topology || "unknown device";
   const proto = protocol.version || (protocol.major != null ? `${protocol.major}.${protocol.minor || 0}` : "unknown");
@@ -1555,18 +1605,12 @@ function renderPhysicalStatus(s) {
   ph.className = state === "live" ? "ready" : ["connecting", "syncing", "busy"].includes(state) ? "busy" : "failed";
   $("#rt").textContent = "";
   $("#fault").textContent = s.error ? `${s.error.code}: ${s.error.message}` : "";
-  const frame = hardware && s.has_frame === true, live = frame && state === "live";
+  const live = current && state === "live";
   $("#screen").classList.toggle("dim", !live);
   $("#note").classList.toggle("show", !live);
-  $("#note span").textContent = live ? "" : frame ? `${state} — last verified frame` : `${state} — waiting for a verified frame`;
+  $("#note span").textContent = live ? "" : hasVerifiedFrame ? `${state} — last verified frame` : `${state} — waiting for a verified frame`;
   const time = t => t == null ? "unknown" : new Date(typeof t === "number" ? t * 1000 : t).toLocaleTimeString();
   hint(`contact ${time(s.last_contact_at)} · snapshot ${time(s.last_snapshot_at)} · display change ${time(s.last_display_change_at)}`);
-  if (frame && can("screen")) {
-    hasVerifiedFrame = true;
-    // Host publications remain distinct across device resets/reconnections.
-    const seq = s.seq;
-    if (seq !== lastSeq) { lastSeq = seq; $("#screen").src = "/screen.png?" + seq; }
-  }
   if (can("leds") && Object.keys(mapLeds).length && !ledStreamOn) panelFetch("/leds").then(r => r.json()).then(applyLeds).catch(() => {});
 }
 

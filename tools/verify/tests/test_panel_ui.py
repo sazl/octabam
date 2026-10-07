@@ -35,6 +35,15 @@ class PanelBrowserTests(unittest.TestCase):
     def test_reconnect_refreshes_same_device_generation_publication(self):
         self.run_browser('publication')
 
+    def test_backend_restart_reuses_seq_with_and_without_observed_failure(self):
+        self.run_browser('lifecycle')
+
+    def test_failed_png_retains_pixels_and_retries_without_false_live_status(self):
+        self.run_browser('image-failure')
+
+    def test_late_png_cannot_replace_new_publication_or_emulator_source(self):
+        self.run_browser('late-image')
+
     def run_browser(self, mode):
         if os.name != 'posix':
             self.skipTest('optional Chromium process-group instrument requires a POSIX host')
@@ -49,15 +58,18 @@ class PanelBrowserTests(unittest.TestCase):
         skin_path = pathlib.Path(skin_dir.name)
         skin = ('window.SKIN=' + (skin_path / 'octatrack-elements.json').read_text() + ';window.SKIN_SVG=' + json.dumps((skin_path / 'octatrack.svg').read_text().replace('id="screen"', 'id="skin-screen"')) + ';').encode()
         state = {'source': 'hardware', 'connection_state': 'live', 'has_frame': True,
+                 'instance_id': 'first', 'image_red': 0, 'image_fail': False,
                  'generation': 127, 'seq': 1, 'protocol': {'major': 1, 'minor': 0, 'epoch': 1, 'connection_id': 1}}
         def png(red):
             def chunk(kind, data):
                 return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
             return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
                     + chunk(b'IDAT', zlib.compress(bytes((0, red, 0, 0)))) + chunk(b'IEND', b''))
-        images = {1: png(0), 2: png(255)}
+        images = {red: png(red) for red in (0, 128, 255)}
         requests = []
         full_requests = []
+        image_gate = threading.Event()
+        image_gate.set()
         audio_gate = threading.Event()
         audio_gate.set()
 
@@ -73,7 +85,14 @@ class PanelBrowserTests(unittest.TestCase):
                     state.update(source=q['source'][0], connection_state=q['state'][0], has_frame=q['frame'][0] == '1')
                     if 'seq' in q:
                         state['seq'] = int(q['seq'][0])
+                        state['image_red'] = 0 if state['seq'] == 1 else 255
                         state['protocol'].update(epoch=state['seq'], connection_id=state['seq'])
+                    for key in ('instance_id', 'image_red', 'image_fail'):
+                        if key in q:
+                            state[key] = q[key][0] if key == 'instance_id' else int(q[key][0])
+                    body = b'{}'
+                elif path == '/image-gate':
+                    image_gate.clear() if q.get('hold') == ['1'] else image_gate.set()
                     body = b'{}'
                 elif path == '/audio-gate':
                     if q.get('hold') == ['1']:
@@ -98,7 +117,9 @@ class PanelBrowserTests(unittest.TestCase):
                             payload.pop('source'); payload['backend'] = 'port'
                         body = b'{invalid' if state['connection_state'] == 'server_error' else json.dumps(payload).encode()
                     elif path == '/screen.png':
-                        body = images[state['seq']]
+                        body = b'invalid PNG' if state['image_fail'] else images[state['image_red']]
+                        if not image_gate.wait(10):
+                            self.send_error(504, 'test image gate timed out'); return
                     elif path == '/map':
                         body = json.dumps({'keys':{'func':[37,5]},'knobs':{'level':48,'A':49},'leds':{}}).encode()
                     elif path == '/audio/status':
@@ -114,7 +135,10 @@ class PanelBrowserTests(unittest.TestCase):
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # superseded browser image request was cancelled
 
             do_POST = do_GET
 
@@ -146,6 +170,7 @@ class PanelBrowserTests(unittest.TestCase):
                     chrome.wait(timeout=10)
                     time.sleep(.1)
         finally:
+            image_gate.set()
             audio_gate.set()
             server.shutdown()
             server.server_close()

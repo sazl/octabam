@@ -136,8 +136,9 @@ stalls. These initial port results are supplemented by the final reviewed
 selected-image validation below. There is no physical unit, project audio
 workload, flash, hardware latency/headroom measurement or driver trace.
 
-The original digital validation used verifier checkpoint `dd7e4cfe`, SHA-256
-`bf0877408affd378132bca5211265f78e5ecf8afae05149a8676057758a79a45`.
+Fresh digital validation after the INFO generation fix used candidate `8c8ff16d`,
+verifier SHA-256
+`2724635f00bddf75c2317ea0e2cf866fb8988456e3de34c3e6b076424dfaf826`.
 It completed all 20 registry-accepted output/input selections on MKI/MKII at
 HS/FS, all four standalone dimensions, and three private negative controls.
 All commands returned zero; original selected MAIN image/runtime were restored
@@ -148,16 +149,27 @@ byte-for-byte and temporary carriers/processes removed.
 | audio-selection matrix | 80/80 runs, 240 measured audio windows; exact four deliberate STALLs per run |
 | standalone | 4/4 runs, no audio interfaces; exact three deliberate STALLs per run |
 | falsification | 3/3 privately altered capture/dispatch/publisher images rejected by the same verifier |
-| output counters | HS measured fault deltas zero; FS short-build counts 0–444 satisfy the reviewed bounds, other measured deltas zero |
+| output counters | HS measured fault deltas zero; FS short-build counts 0–446 satisfy the reviewed bounds, other measured deltas zero |
 | concurrent input diagnostics | 30 HS runs advance input counters and require zero bad/partial packet deltas; input underrun deltas 0–2, no all-zero-input claim |
 | project alignment | genuine SKIP without an authorized source project; strict release acceptance blocked |
 
 The private matrix JSON hash is
-`e03f9179c1b8b197595c933194b1d678537b0f3de3e3d6c3d6d31135805e258a`.
+`d0577f88c1f6c0baa529341a5a4f5038693ab0fa5e500705cf4277f750e21b01`.
 Per-image/runtime fingerprints, raw counter endpoints, dimension audit and
 restoration evidence stay in ignored/local output, not in repository fixtures.
 See the final PR's reached-gate record for combined-root results and their exact
-commit. This matrix remains evidence for the original checkpoint above.
+commit. All 84 normal cases also check initialized INFO generation, its advance
+across three complete updates, and the subsequent validated snapshot generation.
+The later browser lifecycle/retry changes leave this firmware and verifier intact.
+The restored MAIN image SHA-256 is
+`7347b60d19ae6e3ef7946d3b98068055a779fefd7e37bf7e11e2c6a8cf0e2cfe`.
+
+Earlier `dd7e4cfe` evidence remains a separate checkpoint: verifier SHA-256
+`bf0877408affd378132bca5211265f78e5ecf8afae05149a8676057758a79a45`,
+private matrix JSON SHA-256
+`e03f9179c1b8b197595c933194b1d678537b0f3de3e3d6c3d6d31135805e258a`.
+Its FS short-build range was 0–444; those earlier bytes/results are not the
+post-INFO-fix matrix above.
 
 Feature-off comparison of the reviewed core at fixed BUILD=0, XBUS=1, SPEC=1
 found all 25 successful whole images, all 27 normalized build reports and all

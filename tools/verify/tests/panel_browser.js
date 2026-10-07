@@ -16,8 +16,8 @@ async function evaluate(expression, socket = ws) {
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 function assert(value, message) { if (!value) throw new Error(message); }
-async function fixture(source, state = 'live', hasFrame = true, seq = null) {
-  await fetch(`${base}/fixture?source=${source}&state=${state}&frame=${hasFrame ? 1 : 0}${seq == null ? '' : '&seq=' + seq}`);
+async function fixture(source, state = 'live', hasFrame = true, seq = null, extra = {}) {
+  await fetch(`${base}/fixture?source=${source}&state=${state}&frame=${hasFrame ? 1 : 0}${seq == null ? '' : '&seq=' + seq}&${new URLSearchParams(extra)}`);
   await evaluate('poll()');
 }
 const events = `(() => {
@@ -56,9 +56,81 @@ try {
     await fixture('hardware','server_error',false);
     assert((await label()).includes('waiting'), 'no-frame status followed by transport failure must keep waiting');
     await fixture('hardware','live',true);
+    await evaluate(`new Promise((resolve, reject) => {
+      const deadline = Date.now() + 3000;
+      const check = () => hasVerifiedFrame ? resolve(true) : Date.now() > deadline ? reject(new Error('image did not load')) : setTimeout(check, 20);
+      check();
+    })`);
     await fixture('hardware','server_error',true);
     assert((await label()).includes('last verified'), 'transport failure after a frame must label the retained frame');
     console.log('PASS: real Chromium first-status/no-frame failure and verified-frame preservation');
+  } else if (['lifecycle', 'image-failure', 'late-image'].includes(mode)) {
+    const screens = async () => (await (await fetch(`${base}/requests?full=1`)).json()).filter(p => p.startsWith('/screen.png?'));
+    const label = () => evaluate("document.querySelector('#note span').textContent");
+    const phase = () => evaluate("document.querySelector('#phase').textContent");
+    const pixel = () => evaluate(`(() => {
+      const img = document.querySelector('#screen');
+      if (!img.complete || !img.naturalWidth) return null;
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+      const context = canvas.getContext('2d'); context.drawImage(img, 0, 0);
+      return context.getImageData(0, 0, 1, 1).data[0];
+    })()`);
+    async function until(condition, message, timeout = 4000) {
+      const deadline = Date.now() + timeout;
+      while (!(await condition())) { assert(Date.now() < deadline, message); await pause(20); }
+    }
+    const shown = red => until(async () => (await pixel()) === red, `rendered PNG must be red=${red}`);
+    await shown(0);
+    if (mode === 'lifecycle') {
+      // A fast host restart can occur wholly between successful status polls.
+      await fixture('hardware', 'live', true, 1, {instance_id:'second', image_red:255});
+      await shown(255);
+      await fixture('hardware', 'server_error');
+      assert((await label()).includes('last verified'), 'HTTP failure retains verified display label');
+      await fixture('hardware', 'connecting', false, 1, {instance_id:'third', image_red:0});
+      assert((await label()).includes('last verified'), 'new backend without a frame retains old pixels honestly');
+      await fixture('hardware', 'live'); await shown(0);
+      const count = (await screens()).length;
+      await fixture('hardware'); await fixture('hardware'); await pause(400);
+      assert((await screens()).length === count, 'unchanged lifecycle/publication avoids image fetch');
+      assert((await phase()) === 'live', 'loaded current publication is live');
+      console.log('PASS: Chromium same-seq restart with/without observed HTTP failure/no-frame status');
+    } else if (mode === 'image-failure') {
+      await fixture('hardware', 'live', true, 2, {image_fail:1});
+      await until(async () => (await phase()) === 'image unavailable', 'failed PNG must not be labelled live');
+      assert((await pixel()) === 0 && (await label()).includes('last verified'), 'failed PNG preserves last decoded pixels with stale label');
+      const count = (await screens()).length;
+      for (let i=0; i<5; i++) await fixture('hardware');
+      assert((await screens()).length === count, 'failure retry is rate bounded across later polls');
+      await fixture('hardware', 'live', true, null, {image_fail:0});
+      await shown(255);
+      assert((await phase()) === 'live', 'successful later retry restores live');
+      assert((await screens()).length > count, 'retry reaches the no-store server instead of reusing a failed response');
+      // A first-frame failure must not claim a locally verified display.
+      await fetch(`${base}/fixture?source=hardware&state=live&frame=1&seq=1&image_fail=1`);
+      await call('Page.navigate', {url:base});
+      await until(async () => (await phase()) === 'image unavailable', 'first failed image must report unavailable');
+      assert((await label()).includes('waiting'), 'first failed PNG waits for verified pixels');
+      await fixture('hardware', 'live', true, null, {image_fail:0}); await shown(0);
+      console.log('PASS: Chromium invalid PNG retains pixels, bounded poll retry recovers, first-frame failure remains waiting');
+    } else {
+      await fetch(`${base}/image-gate?hold=1`);
+      const count = (await screens()).length;
+      await fixture('hardware', 'live', true, 2);
+      await until(async () => (await screens()).length > count, 'delayed image must reach server');
+      assert((await pixel()) === 0 && (await phase()) !== 'live', 'pending image retains pixels with non-live status');
+      await fixture('hardware', 'live', true, 3, {image_red:128});
+      await fetch(`${base}/image-gate?hold=0`); await shown(128); await pause(150);
+      assert((await pixel()) === 128, 'late superseded image must not replace newer publication');
+      await fetch(`${base}/image-gate?hold=1`);
+      await fixture('hardware', 'live', true, 4, {image_red:255});
+      await until(async () => (await phase()) === 'image unavailable', 'in-flight image timeout must be finite', 7000);
+      assert((await pixel()) === 128, 'timed-out image retains previous pixels');
+      await fixture('legacy', 'live', true, 1);
+      await fetch(`${base}/image-gate?hold=0`); await shown(0); await pause(200);
+      assert((await pixel()) === 0, 'late hardware image cannot replace emulator screen');
+      console.log('PASS: Chromium finite image timeout, newer-publication and source-switch late-completion guards');
+    }
   } else if (mode === 'publication') {
     const screens = async () => (await (await fetch(`${base}/requests?full=1`)).json()).filter(p => p.startsWith('/screen.png?'));
     const pixel = () => evaluate(`(() => {
@@ -89,7 +161,7 @@ try {
     assert((await evaluate("document.querySelector('#note span').textContent")).includes('last verified'), 'retained PNG is labelled stale');
     await fixture('hardware', 'live', true, 2);
     await shown(255);
-    assert(JSON.stringify(await screens()) === JSON.stringify(['/screen.png?1', '/screen.png?2']), 'same device generation with new host seq/epoch/connection must fetch new publication');
+    assert(JSON.stringify((await screens()).map(p => { const q = new URL(p, base).searchParams; return [q.get('instance'), q.get('seq')]; })) === JSON.stringify([['first', '1'], ['first', '2']]), 'same device generation with new host seq/epoch/connection must fetch new publication');
     await fixture('hardware'); await fixture('hardware'); await pause(400);
     assert((await screens()).length === 2, 'unchanged host publication must not refetch PNG');
     await fixture('legacy', 'live', true, 1); await requested(3); await shown(0);
@@ -140,7 +212,7 @@ try {
   await fixture('hardware','live');
   assert(await evaluate("!document.querySelector('#note').classList.contains('show')"), 'static generation reconnect remains live');
   await fixture('hardware','unsupported',false);
-  assert((await evaluate("document.querySelector('#note span').textContent")).includes('waiting'), 'no valid frame distinguished');
+  assert((await evaluate("document.querySelector('#note span').textContent")).includes('last verified'), 'backend without a frame retains the locally verified pixels honestly');
   await fixture('legacy');
   assert((await evaluate("document.querySelector('#source').textContent")) === 'EMULATOR', 'historical backend=port without source remains interactive');
   await evaluate(`document.querySelector('.knob.live').dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaY:-100})); setFader(11);`);

@@ -18,6 +18,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 
 # Existing panel tools import their shared renderer by its script-directory
 # name. Keep one class identity for those consumers in package mode as well.
@@ -53,6 +54,7 @@ class HardwareBackend:
         configured_period = 1 / rate
         if not math.isfinite(configured_period) or configured_period > threading.TIMEOUT_MAX:
             raise ValueError("poll_hz is too small: polling interval must not exceed threading.TIMEOUT_MAX seconds")
+        self._instance_id = uuid.uuid4().hex
         self._selector = mirror.DeviceSelector.parse(selector)
         self._selector_text = selector
         self._factory = mirror.open_transport if transport_factory is None else transport_factory
@@ -112,6 +114,7 @@ class HardwareBackend:
                 error = ("timeout", "No successful device contact within the liveness threshold")
         return {
             "source": self.source, "backend": "hardware", "read_only": True,
+            "instance_id": self._instance_id,
             "connection_state": state, "capabilities": sorted(capabilities),
             "negotiated_capabilities": sorted(self._offered(info)) if info else [],
             "generation": generation, "seq": view.generation if view else None,
