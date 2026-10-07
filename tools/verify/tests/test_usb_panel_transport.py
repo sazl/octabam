@@ -75,6 +75,12 @@ class TransportTests(unittest.TestCase):
             transport=m.open_transport(m.DeviceSelector.parse(selector),**kw)
         return transport,util
 
+    def test_transport_error_exposes_code_and_message(self):
+        error=m.TransportError('timeout','finite transfer timed out')
+        self.assertEqual(error.code,'timeout')
+        self.assertEqual(error.message,'finite transfer timed out')
+        self.assertEqual(str(error),error.message)
+
     def test_selector_and_initial_identity(self):
         self.assertEqual(m.DeviceSelector.parse('serial:unit-A').serial,'unit-A')
         self.assertEqual(m.DeviceSelector.parse('topology:1-2.3').port_numbers,(2,3))
