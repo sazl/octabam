@@ -5,6 +5,7 @@ import struct
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from tools.panel import usb_mirror_protocol as p
 from tools.panel import usb_mirror as mirror
@@ -112,25 +113,51 @@ class InputHttpTests(unittest.TestCase):
     wait_for = HardwareHttpIntegration.wait_for
     request = HardwareHttpIntegration.request
     def test_negotiated_poll_interval_includes_snapshot_transfer_time(self):
-        from tools.panel.hardware_backend import HardwareBackend
+        from tools.panel import hardware_backend as hardware
 
-        class DelayedChangingTransport(InputTransport):
+        # Run the actual worker/client synchronously: USB exchange work and
+        # event waits advance a virtual monotonic clock. Wall-clock scheduling
+        # of dozens of tiny sleeps cannot change the intended 98 ms work cost.
+        clock = [10.0]
+
+        class WorkCostTransport(InputTransport):
             def exchange(self, request, *, timeout_ms=250):
                 if request.request == p.REQUEST_INFO:
                     self.change(generation=self.generation + 1)
-                # Approximately 100 ms across INFO, BEGIN, 46 actual READ
-                # responses and RELEASE. This is external I/O, not rendering.
-                time.sleep(.002)
+                clock[0] += .002
                 return super().exchange(request, timeout_ms=timeout_ms)
 
-        peer = DelayedChangingTransport(flags=FLAGS | 0x40, data=body() + record(), poll=200)
-        backend = HardwareBackend(poll_hz=50, transport_factory=lambda *a, **k: peer)
-        self.addCleanup(backend.close)
-        calls = self.wait_for(lambda: peer.calls_for(p.REQUEST_INFO)
-                              if len(peer.calls_for(p.REQUEST_INFO)) >= 3 else None)
+        class ThreePolls:
+            stopped = False
+            cycles = 0
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, timeout):
+                clock[0] += timeout
+                self.cycles += 1
+                self.stopped = self.cycles == 3
+                return self.stopped
+
+        peer = WorkCostTransport(flags=FLAGS | 0x40, data=body() + record(), poll=200)
+        with patch.object(hardware.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(hardware.threading.Thread, 'start'):
+            backend = hardware.HardwareBackend(poll_hz=50, transport_factory=lambda *a, **k: peer)
+            backend._stop = ThreePolls()
+            backend._run()
+
+        calls = peer.calls_for(p.REQUEST_INFO)
+        self.assertEqual(len(calls), 3)
         intervals = [b[1] - a[1] for a, b in zip(calls, calls[1:])]
-        self.assertTrue(all(.195 <= interval < .26 for interval in intervals), intervals)
-        self.assertGreaterEqual(len(peer.calls_for(p.REQUEST_RELEASE)), 2)
+        # 200 ms starts include INFO + BEGIN + 46 READs + RELEASE (49 * 2 ms),
+        # rather than adding that work after every complete 200 ms wait.
+        for interval in intervals:
+            self.assertAlmostEqual(interval, .2, places=9)
+        self.assertEqual(len(peer.calls_for(p.REQUEST_READ)), 138)
+        self.assertEqual(len(peer.calls_for(p.REQUEST_RELEASE)), 3)
+        self.assertEqual(backend.snapshot().generation, 3)
+        self.assertEqual(backend.snapshot().inputs.fader, 73)
 
     def test_slow_transport_discovery_does_not_shorten_first_info_interval(self):
         from tools.panel.hardware_backend import HardwareBackend

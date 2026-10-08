@@ -1,14 +1,34 @@
 // Optional real-browser instrument: Node's built-in WebSocket, no npm packages.
 const endpoint = process.argv[2], base = process.argv[3], mode = process.argv[4] || "capabilities";
-const ws = new WebSocket(endpoint);
-await new Promise(resolve => ws.addEventListener('open', resolve, {once: true}));
 let id = 0;
-const pending = new Map();
-ws.addEventListener('message', e => {
-  const r = JSON.parse(e.data);
-  if (r.id) { const p = pending.get(r.id); pending.delete(r.id); r.error ? p.reject(r.error) : p.resolve(r.result); }
-});
-function call(method, params = {}, socket = ws) { return new Promise((resolve, reject) => { const n = ++id; pending.set(n, {resolve, reject}); socket.send(JSON.stringify({id: n, method, params})); }); }
+const pending = new Map(), sockets = new Set();
+async function connect(url) {
+  const socket = new WebSocket(url); sockets.add(socket);
+  socket.addEventListener('message', e => {
+    const r = JSON.parse(e.data), p = pending.get(r.id);
+    if (!p) return;
+    pending.delete(r.id); clearTimeout(p.timer);
+    r.error ? p.reject(new Error(JSON.stringify(r.error))) : p.resolve(r.result);
+  });
+  socket.addEventListener('close', () => {
+    for (const [n,p] of pending) if (p.socket === socket) {
+      pending.delete(n); clearTimeout(p.timer); p.reject(new Error('Browser debugging WebSocket closed'));
+    }
+  });
+  await new Promise((resolve,reject) => {
+    const timer = setTimeout(() => {socket.close(); reject(new Error(`Browser debugging WebSocket did not open: ${url}`));},10000);
+    socket.addEventListener('open', () => {clearTimeout(timer); resolve();}, {once:true});
+    socket.addEventListener('error', () => {clearTimeout(timer); reject(new Error(`Browser debugging WebSocket failed: ${url}`));}, {once:true});
+  });
+  return socket;
+}
+const ws = await connect(endpoint);
+function call(method, params = {}, socket = ws) {
+  return new Promise((resolve,reject) => {
+    const n=++id, timer=setTimeout(() => {pending.delete(n); reject(new Error(`Browser debugging command timed out: ${method}`));},10000);
+    pending.set(n,{resolve,reject,timer,socket}); socket.send(JSON.stringify({id:n,method,params}));
+  });
+}
 async function evaluate(expression, socket = ws) {
   const r = await call('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true}, socket);
   if (r.exceptionDetails) throw new Error(JSON.stringify(r.exceptionDetails));
@@ -16,6 +36,44 @@ async function evaluate(expression, socket = ws) {
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 function assert(value, message) { if (!value) throw new Error(message); }
+async function waitPanelReady(socket = ws, previousOrigin = null) {
+  const deadline=Date.now()+10000;
+  let last;
+  do {
+    try {
+      last=await evaluate(`({url:location.href,origin:performance.timeOrigin,ready:document.readyState,
+        controls:['.k[data-id="yes"]','.knob.live','#fbed','#card','#hp','.knob.pot'].every(selector=>document.querySelector(selector)),
+        mapped:typeof mapKeys!=='undefined' && Object.keys(mapKeys).length>0,
+        source:typeof source==='undefined'?null:source,phase:document.querySelector('#phase')?.textContent})`,socket);
+      if (last.origin!==previousOrigin && last.url===base && last.ready==='complete' && last.controls && last.mapped &&
+          (last.source!==null || last.phase==='server unreachable')) return;
+    } catch (error) {
+      if (!/Execution context was destroyed|Cannot find context|Cannot find default execution context/.test(error.message)) throw error;
+      last={context:error.message};
+    }
+    await pause(20);
+  } while (Date.now()<deadline);
+  throw new Error('Panel document did not become ready: '+JSON.stringify(last));
+}
+async function navigatePanel(socket = ws) {
+  const origin=await evaluate('performance.timeOrigin',socket);
+  const navigation=await call('Page.navigate',{url:base},socket);
+  assert(!navigation.errorText,'Panel navigation failed: '+navigation.errorText);
+  await waitPanelReady(socket,origin);
+}
+async function createPanelTab() {
+  const target=await call('Target.createTarget',{url:'about:blank'}), deadline=Date.now()+10000;
+  let tab;
+  do {
+    const tabs=await (await fetch('http://'+new URL(endpoint).host+'/json/list',{signal:AbortSignal.timeout(1000)})).json();
+    tab=tabs.find(tab=>tab.id===target.targetId && tab.webSocketDebuggerUrl);
+    if (!tab) await pause(20);
+  } while (!tab && Date.now()<deadline);
+  assert(tab,'New browser tab did not publish its debugging WebSocket');
+  const second=await connect(tab.webSocketDebuggerUrl);
+  await call('Page.enable',{},second); await navigatePanel(second);
+  return {target,second};
+}
 async function fixture(source, state = 'live', hasFrame = true, seq = null, extra = {}) {
   await fetch(`${base}/fixture?source=${source}&state=${state}&frame=${hasFrame ? 1 : 0}${seq == null ? '' : '&seq=' + seq}&${new URLSearchParams(extra)}`);
   await evaluate('poll()');
@@ -47,8 +105,7 @@ const events = `(() => {
 try {
   await call('Page.enable');
   if (mode === 'no-frame-failure') await fetch(`${base}/fixture?source=hardware&state=server_error&frame=0`);
-  await call('Page.navigate', {url:base});
-  await pause(800);
+  await navigatePanel();
   if (mode === 'inputs') {
     const input = {known:7, fader:0, keys:[0,0,0,0,0,0,2,127], press_counts:Array(64).fill(0), encoder_counts:Array.from({length:7}, () => [0,0])};
     input.press_counts[49] = 65535; input.encoder_counts[0] = [65535, 100];
@@ -87,11 +144,7 @@ try {
     assert(await has(knob,'turn-ccw'), 'counterclockwise detents must show counterclockwise activity');
     input.keys[6] = 2; await patch({inputs:input}); await pause(280);
     assert(await has(key,'physical-held'), 'held keys stay lit after transient timers expire');
-    const target = await call('Target.createTarget', {url:base}); await pause(600);
-    const tabs = await (await fetch('http://' + new URL(endpoint).host + '/json/list')).json();
-    const second = new WebSocket(tabs.find(t => t.id === target.targetId).webSocketDebuggerUrl);
-    await new Promise(resolve => second.addEventListener('open',resolve,{once:true}));
-    second.addEventListener('message', e => { const r=JSON.parse(e.data); if(r.id) { const p=pending.get(r.id);pending.delete(r.id);r.error?p.reject(r.error):p.resolve(r.result); } });
+    const {target,second}=await createPanelTab();
     assert(await has(key,'physical-held',second), 'new tab sees present holds');
     assert(!(await has(key,'physical-tap',second)) && !(await has(knob,'turn-cw',second)), 'new tab must baseline historic activity independently');
     input.press_counts[49] = 1; input.encoder_counts[0][0] = 3;
@@ -226,7 +279,7 @@ try {
     await fixture('hardware','server_error');
     assert(await quiet() && await evaluate(`document.querySelector('#phase').textContent === 'server unreachable'`), 'errors stay in header without an LCD overlay or dimming');
     await fetch(`${base}/image-gate?hold=1`);
-    await call('Page.navigate',{url:base}); await pause(500);
+    await navigatePanel();
     assert(await evaluate(`!document.querySelector('#screen').hasAttribute('src') && getComputedStyle(document.querySelector('#note')).display === 'none'`), 'before first verified frame the LCD stays neutral blank');
     await fetch(`${base}/image-gate?hold=0`);
     console.log('PASS: quiet refresh, full-brightness retained LCD, header-only errors, neutral initial screen');
@@ -289,7 +342,7 @@ try {
       assert((await screens()).length > count, 'retry reaches the no-store server instead of reusing a failed response');
       // A first-frame failure must not claim a locally verified display.
       await fetch(`${base}/fixture?source=hardware&state=live&frame=1&seq=1&image_fail=1`);
-      await call('Page.navigate', {url:base});
+      await navigatePanel();
       await until(async () => (await phase()) === 'image unavailable', 'first failed image must report unavailable');
       assert((await label()) === 'image unavailable', 'first failed PNG reports its error in the header');
       await fixture('hardware', 'live', true, null, {image_fail:0}); await shown(0);
@@ -349,7 +402,7 @@ try {
     assert((await screens()).length === 3, 'source transition renders emulator publication');
     await fixture('hardware', 'live', true, 2); await requested(4); await shown(255);
     assert((await screens()).length === 4, 'returning hardware source renders current publication');
-    await call('Page.navigate', {url:base}); await pause(600); await shown(255);
+    await navigatePanel(); await shown(255);
     assert((await screens()).length === 5, 'reload renders the current hardware publication');
     assert((await evaluate("document.querySelector('#source').textContent")).includes('READ ONLY'), 'reconnected/reloaded hardware remains read only');
     console.log('PASS: Chromium renders distinct PNG pixels across same-generation reconnect, retains stale pixels, suppresses unchanged seq, and preserves source-switch/reload rendering');
@@ -419,19 +472,16 @@ try {
   assert(await evaluate("document.querySelectorAll('.held,.down').length === 0 && !shiftHeld && pending.size === 0 && !FADER.timer"), 'capability transition clears modifiers and pending controls');
   await fetch(`${base}/requests?clear=1`);
   // Two simultaneous real browser tabs consume the shared fake backend.
-  const target = await call('Target.createTarget', {url:base});
-  await pause(500);
-  const debugBase = 'http://' + new URL(endpoint).host;
-  const tabs = await (await fetch(debugBase + '/json/list')).json();
-  const second = new WebSocket(tabs.find(t => t.id === target.targetId).webSocketDebuggerUrl);
-  await new Promise(resolve => second.addEventListener('open',resolve,{once:true}));
-  second.addEventListener('message', e => { const r = JSON.parse(e.data); if (r.id) { const p = pending.get(r.id); pending.delete(r.id); r.error ? p.reject(r.error) : p.resolve(r.result); } });
+  if (mode === 'delayed-tab') {
+    await fetch(`${base}/page-gate?hold=1&delay=1500`);
+  }
+  const {target,second}=await createPanelTab();
   await evaluate(events,second); await evaluate(events); await pause(150);
   assert((await evaluate("document.querySelector('#source').textContent", second)).includes('READ ONLY'), 'second tab must identify hardware');
   second.close(); await call('Target.closeTarget',{targetId:target.targetId});
-  await call('Page.navigate',{url:base}); await pause(500); await evaluate(events); await pause(150);
+  await navigatePanel(); await evaluate(events); await pause(150);
   requests = await (await fetch(`${base}/requests`)).json();
   assert(requests.every(p => allowed.has(p)), 'hardware reload must remain read only');
   console.log('PASS: Chromium DOM pointer/wheel/touch/keyboard/drop, primitive guards, modifier release, source transition, static live/disconnect/reconnect, emulator key/wheel/fader, two simultaneous hardware tabs/reload');
   }
-} finally { ws.close(); }
+} finally { for (const socket of sockets) socket.close(); }

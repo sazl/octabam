@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import signal
+import sys
 import struct
 import zlib
 import pathlib
@@ -17,9 +18,76 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+BROWSER_START_TIMEOUT_S = 30
+BROWSER_STOP_TIMEOUT_S = 3
+
+
+def _browser_stderr(log):
+    size = os.fstat(log.fileno()).st_size
+    return os.pread(log.fileno(), min(size, 16384), max(0, size - 16384)).decode('utf-8', 'replace')
+
+
+def _wait_debugger_page(process, profile, log):
+    """Wait for the port file AND a usable page endpoint; keep launch evidence."""
+    marker = pathlib.Path(profile) / 'DevToolsActivePort'
+    deadline = time.monotonic() + BROWSER_START_TIMEOUT_S
+    last = 'DevToolsActivePort has not been published'
+    while time.monotonic() < deadline:
+        if marker.exists():
+            try:
+                port = int(marker.read_text().splitlines()[0])
+                if not 0 < port < 65536:
+                    raise ValueError(f'invalid debugging port {port}')
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list', timeout=.5) as response:
+                    tabs = json.load(response)
+                if not isinstance(tabs, list):
+                    raise ValueError('debugging endpoint did not return a target list')
+                page = next((tab for tab in tabs if isinstance(tab, dict) and tab.get('type') == 'page' and tab.get('webSocketDebuggerUrl')), None)
+                if page is not None:
+                    return page['webSocketDebuggerUrl']
+                last = 'debugging HTTP endpoint has no page WebSocket yet'
+            except (OSError, ValueError, IndexError) as error:
+                last = f'debugging endpoint not ready: {error}'
+        code = process.poll()
+        if code is not None:
+            break
+        time.sleep(.05)
+    raise AssertionError(f'Browser debugging readiness failed: pid={process.pid}, returncode={process.poll()}, '
+                         f'executable={process.args[0]}, last={last}\nBrowser stderr:\n{_browser_stderr(log)}')
+
+
+def _stop_browser(process):
+    """Terminate the owned process group, escalate, and reap the launcher."""
+    def send(sig):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if process.poll() is None:
+                raise
+            # macOS can return EPERM as the reaped group's last members vanish.
+            # Accept that race only after checking that no live group member remains.
+            listing = subprocess.run(['ps', '-axo', 'pid=,pgid=,stat='], capture_output=True, text=True, timeout=2)
+            if listing.returncode:
+                raise
+            for line in listing.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 3 and int(fields[1]) == process.pid and not fields[2].startswith(('Z', 'X')):
+                    raise
+    send(signal.SIGTERM)
+    try:
+        process.wait(timeout=BROWSER_STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        send(signal.SIGKILL)
+        process.wait(timeout=BROWSER_STOP_TIMEOUT_S)
+    finally:
+        # The launcher may exit before its children; stop remaining owned writers.
+        send(signal.SIGKILL)
 
 
 class PanelBrowserTests(unittest.TestCase):
@@ -56,6 +124,12 @@ class PanelBrowserTests(unittest.TestCase):
     def test_cached_hardware_inputs_have_bounded_browser_poll_latency(self):
         print(self.run_browser('poll-latency').strip())
 
+    def test_delayed_initial_skin_waits_for_panel_readiness(self):
+        self.run_browser('delayed-initial')
+
+    def test_delayed_second_tab_skin_waits_for_panel_readiness(self):
+        self.run_browser('delayed-tab')
+
     def run_browser(self, mode):
         if os.name != 'posix':
             self.skipTest('optional Chromium process-group instrument requires a POSIX host')
@@ -70,7 +144,7 @@ class PanelBrowserTests(unittest.TestCase):
         if subprocess.run([node, '-p', 'typeof WebSocket'], capture_output=True, text=True).stdout.strip() != 'function':
             self.skipTest('existing Node lacks built-in WebSocket')
         skin_dir = tempfile.TemporaryDirectory(prefix='panel-skin-')
-        subprocess.run([shutil.which('python3'), str(ROOT / 'tools/panel/skin/gen_svg.py'), skin_dir.name], check=True, capture_output=True)
+        subprocess.run([sys.executable, str(ROOT / 'tools/panel/skin/gen_svg.py'), skin_dir.name], check=True, capture_output=True)
         skin_path = pathlib.Path(skin_dir.name)
         skin = ('window.SKIN=' + (skin_path / 'octatrack-elements.json').read_text() + ';window.SKIN_SVG=' + json.dumps((skin_path / 'octatrack.svg').read_text().replace('id="screen"', 'id="skin-screen"')) + ';').encode()
         state = {'source': 'hardware', 'connection_state': 'live', 'has_frame': True,
@@ -88,6 +162,12 @@ class PanelBrowserTests(unittest.TestCase):
         image_gate.set()
         audio_gate = threading.Event()
         audio_gate.set()
+        page_gate = threading.Event()
+        page_gate.set()
+        page_release_scheduled = threading.Event()
+        page_delay = {"seconds": 1.5 if mode == "delayed-initial" else None}
+        if mode == "delayed-initial":
+            page_gate.clear()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -114,6 +194,11 @@ class PanelBrowserTests(unittest.TestCase):
                         else:
                             state[key] = value
                     body = b'{}'
+                elif path == '/page-gate':
+                    page_gate.clear() if q.get('hold') == ['1'] else page_gate.set()
+                    page_release_scheduled.clear()
+                    page_delay['seconds'] = int(q['delay'][0]) / 1000 if 'delay' in q else None
+                    body = b'{}'
                 elif path == '/image-gate':
                     image_gate.clear() if q.get('hold') == ['1'] else image_gate.set()
                     body = b'{}'
@@ -133,6 +218,11 @@ class PanelBrowserTests(unittest.TestCase):
                     if path == '/':
                         body = (ROOT / 'tools/panel/panel.html').read_bytes()
                     elif path == '/skin.js':
+                        if not page_gate.is_set() and page_delay['seconds'] is not None and not page_release_scheduled.is_set():
+                            page_release_scheduled.set()
+                            threading.Timer(page_delay['seconds'], page_gate.set).start()
+                        if not page_gate.wait(10):
+                            self.send_error(504, 'test page gate timed out'); return
                         body = skin
                     elif path == '/status':
                         payload = dict(state, backend=state['source'], read_only=state['source'] == 'hardware', capabilities=state.get('capabilities', ['screen']) if state['source'] == 'hardware' else ['screen','leds','controls','emulator','samples','card','audio'], model=None, device={'serial':'fake-only'}, build='synthetic', last_contact_at=time.time(), last_snapshot_at=time.time(), last_display_change_at=1, phase='ready', booted=True)
@@ -169,37 +259,127 @@ class PanelBrowserTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory(prefix='panel-browser-') as profile:
-                chrome = subprocess.Popen([chromium,'--headless','--no-sandbox','--disable-gpu','--remote-debugging-port=0',f'--user-data-dir={profile}','about:blank'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            with tempfile.TemporaryDirectory(prefix='panel-browser-') as profile, tempfile.TemporaryFile() as browser_log:
+                chrome = subprocess.Popen([chromium,'--headless','--no-sandbox','--disable-gpu','--remote-debugging-port=0',f'--user-data-dir={profile}','about:blank'], stdout=subprocess.DEVNULL, stderr=browser_log, start_new_session=True)
+                failure = None
                 try:
-                    marker = pathlib.Path(profile) / 'DevToolsActivePort'
-                    deadline = time.monotonic() + 10
-                    while not marker.exists() and chrome.poll() is None and time.monotonic() < deadline:
-                        time.sleep(.05)
-                    self.assertTrue(marker.exists(), 'Chromium must start its real-browser instrument')
-                    port = marker.read_text().splitlines()[0]
-                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list') as response:
-                        tabs = json.load(response)
-                    ws = next(t['webSocketDebuggerUrl'] for t in tabs if t['type'] == 'page')
-                    run = subprocess.run([node,str(pathlib.Path(__file__).with_name('panel_browser.js')),ws,f'http://127.0.0.1:{server.server_port}/',mode], capture_output=True, text=True, timeout=30)
-                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-                finally:
-                    # Chromium uses child processes; stop the whole test group
-                    # so profile writers cannot race temporary-directory cleanup.
+                    ws = _wait_debugger_page(chrome, profile, browser_log)
                     try:
-                        os.killpg(chrome.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    chrome.wait(timeout=10)
-                    time.sleep(.1)
+                        run = subprocess.run([node,str(pathlib.Path(__file__).with_name('panel_browser.js')),ws,f'http://127.0.0.1:{server.server_port}/',mode], capture_output=True, text=True, timeout=60)
+                    except subprocess.TimeoutExpired as error:
+                        raise AssertionError(f'Browser scenario {mode} timed out after debugging readiness\n'
+                                             f'stdout={error.stdout!r}\nstderr={error.stderr!r}\nBrowser stderr:\n{_browser_stderr(browser_log)}') from error
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                except BaseException as error:
+                    failure = error
+                    raise
+                finally:
+                    try:
+                        _stop_browser(chrome)
+                    except Exception as error:
+                        details = f'Browser cleanup also failed: {error}\nBrowser stderr:\n{_browser_stderr(browser_log)}'
+                        if failure is None:
+                            raise AssertionError(details) from error
+                        if hasattr(failure, 'add_note'):
+                            failure.add_note(details)
+                        else:
+                            failure.args = (*failure.args, details)
         finally:
             image_gate.set()
             audio_gate.set()
+            page_gate.set()
             server.shutdown()
             server.server_close()
             thread.join()
             skin_dir.cleanup()
         return run.stdout
+
+
+class BrowserLaunchDiagnosticsTests(unittest.TestCase):
+    def _failed_browser(self, hang):
+        if os.name != 'posix' or not shutil.which('node'):
+            self.skipTest('browser harness process checks require POSIX and Node')
+        with tempfile.TemporaryDirectory(prefix='panel-fake-browser-') as directory:
+            browser = pathlib.Path(directory) / 'fake-browser'
+            ready = pathlib.Path(directory) / 'ready'
+            code = [f'#!{sys.executable}', 'import pathlib, signal, sys, time',
+                    "sys.stderr.write('intentional browser startup failure\\n'); sys.stderr.flush()"]
+            if hang:
+                code += ['signal.signal(signal.SIGTERM, signal.SIG_IGN)',
+                         "profile = pathlib.Path(next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--user-data-dir=')))",
+                         "(profile / 'DevToolsActivePort').write_text('1\\n/fake\\n')", f'pathlib.Path({str(ready)!r}).touch()', 'while True: time.sleep(1)']
+            else:
+                code += [f'pathlib.Path({str(ready)!r}).touch()', 'sys.exit(7)']
+            browser.write_text('\n'.join(code) + '\n'); browser.chmod(0o755)
+            processes = []
+            real_popen = subprocess.Popen
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                if args[0][0] == str(browser):
+                    processes.append(process)
+                    deadline = time.monotonic() + 3
+                    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(ready.exists(), 'fake process must reach its deliberately failing state before the startup clock begins')
+                return process
+            try:
+                with mock.patch.dict(os.environ, {'PANEL_BROWSER': str(browser)}), mock.patch.object(sys.modules[__name__], 'BROWSER_START_TIMEOUT_S', .3, create=True), mock.patch('subprocess.Popen', side_effect=launch):
+                    try:
+                        PanelBrowserTests('test_capabilities_guard_real_browser_events').run_browser('capabilities')
+                    except Exception as error:
+                        result = error
+                    else:
+                        self.fail('fake browser must fail before browser assertions run')
+                self.assertIsInstance(result, AssertionError, 'launch failure must survive cleanup without becoming TimeoutExpired')
+                self.assertIn('intentional browser startup failure', str(result), 'real browser stderr must explain launch failures')
+                self.assertIn('debugging', str(result), 'failure must identify the unmet debugging readiness stage')
+                if not hang:
+                    self.assertIn('7', str(result), 'early process exit must report its return code')
+                self.assertTrue(processes and all(process.poll() is not None for process in processes), 'browser processes must be reaped even when SIGTERM is ignored')
+            finally:
+                for process in processes:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=3)
+
+    def test_post_reap_permission_error_requires_group_disappearance(self):
+        if os.name != 'posix':
+            self.skipTest('owned process-group check requires POSIX')
+        process = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        process.wait(timeout=3)
+        original = os.killpg
+        def signal_group(pid, sig):
+            if sig == signal.SIGKILL:
+                raise PermissionError('simulated disappearing process group')
+            return original(pid, sig)
+        with mock.patch('os.killpg', side_effect=signal_group):
+            _stop_browser(process)
+
+    def test_post_reap_permission_error_does_not_hide_live_owned_child(self):
+        if os.name != 'posix' or not hasattr(os, 'fork'):
+            self.skipTest('owned child process-group check requires POSIX fork')
+        process = subprocess.Popen([sys.executable, '-c', 'import os,time; child=os.fork(); time.sleep(60) if child==0 else None'], start_new_session=True)
+        process.wait(timeout=3)
+        original = os.killpg
+        def signal_group(pid, sig):
+            if sig == signal.SIGKILL:
+                raise PermissionError('live owned child cannot be signalled')
+        try:
+            with mock.patch('os.killpg', side_effect=signal_group), self.assertRaisesRegex(PermissionError, 'live owned child'):
+                _stop_browser(process)
+        finally:
+            try:
+                original(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def test_early_browser_exit_reports_stderr_and_return_code(self):
+        self._failed_browser(False)
+
+    def test_debugger_startup_timeout_keeps_cause_and_kills_stubborn_browser(self):
+        self._failed_browser(True)
 
 
 class NativeSourcePolicyInspection(unittest.TestCase):
