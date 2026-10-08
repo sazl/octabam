@@ -116,7 +116,7 @@ from the card (section 5).
 | [**USB CROSSBAR**](modules/usb-crossbar/README.md) | [bryantysinger](https://github.com/bryantysinger) | The USB controller bursts and arbitrates first on the SDRAM and SRAM crossbar ports (SCM BCR, XBS PRS/CRS), set at boot; cures lost isochronous packet tails. | on hardware: the register values, written at stream-up by usbin-test builds 12-16 on Bryan T's MKII (26-27 Sep 2026); this boot-time write under the port only |
 | [**USB MIDI**](modules/usb-midi/README.md) | [markandrus/octemu](https://github.com/markandrus/octemu) | Class-compliant USB-MIDI in and out on the OT's own USB port, mirroring the DIN ports (markandrus/octemu). | on hardware: Sam's MKII (image 64, 25 Sep 2026: enumerates, receives 7,950 msg/s); Tim's MKI (OCTATRICK9, 26 Sep 2026); USB clock tempo on Kazeko's MKI (#633, 6 Oct 2026); transmit from the unit not measured |
 | [**USB PANEL MIRROR**](modules/usb-panel-mirror/README.md) | [Sami Zeinelabdin](https://github.com/sazl) | Experimental read-only LCD/LED snapshots from accepted panel bytes over vendor EP0. | `make check`: Experimental: MKI/MKII accepted-UART capture and EP0 snapshots verified under the port; pre-ISR abort timing and physical coexistence remain unmeasured. |
-| [**USB PANEL MIRROR STANDALONE**](modules/usb-panel-mirror-standalone/README.md) | [Sami Zeinelabdin](https://github.com/sazl) | USB MIDI-only EP0 adapter for the panel mirror. | `make check`: Experimental adapter; no hardware proof. |
+| [**USB PANEL MIRROR STANDALONE**](modules/usb-panel-mirror-standalone/README.md) | [Sami Zeinelabdin](https://github.com/sazl) | Automatic USB MIDI-only EP0 adapter for the panel mirror; omitted with audio output. | `make check`: Experimental adapter; no hardware proof. |
 
 ### Fixes
 

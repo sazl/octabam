@@ -1,9 +1,9 @@
-"""Mutually exclusive USB MIDI-only dispatcher for USB PANEL MIRROR."""
+"""Automatically selected USB MIDI-only dispatcher for USB PANEL MIRROR."""
 from remix.schema import Category, Detour, Kind, Linked, Module, Proof
 OUTPUTS=tuple('USB AUDIO OUT '+s for s in ('MAIN','MAIN CUE','MASTER','TRACKS','TRACKS MAIN CUE'))
 MODULE=Module(name='usb-panel-mirror-standalone',key='USB PANEL MIRROR STANDALONE',kind=Kind.CF_PATCH,
     category=Category.MIDI_USB,author='Sami Zeinelabdin',author_url='https://github.com/sazl',
-    proof=Proof.CHECK,proof_note='Experimental adapter; no hardware proof.',doc='USB MIDI-only EP0 adapter for the panel mirror.',
+    proof=Proof.CHECK,proof_note='Experimental adapter; no hardware proof.',doc='Automatic USB MIDI-only EP0 adapter for the panel mirror; omitted with audio output.',
     requires=('USB MIDI','USB PANEL MIRROR'),
     linked=(Linked('panel_adapter','modules/usb-panel-mirror-standalone/adapter.s',cpu='5475',dram=True),),
     detours=(

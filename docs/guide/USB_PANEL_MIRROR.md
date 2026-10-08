@@ -11,9 +11,9 @@ macOS launcher remains emulator-only; use a browser for the physical viewer.
 
 The host requires the OTPM v1 handshake, complete LCD coverage, lease and CRC
 capabilities. Stock firmware and an ordinary USB audio/MIDI remix do not export
-this protocol. A selectable exporter must include USB PANEL MIRROR, USB MIDI,
-and exactly one USB dispatcher: a supported audio output or USB PANEL MIRROR
-STANDALONE. CF METER IDLE conflicts with its publisher. Consult the module and
+this protocol. Select USB PANEL MIRROR and USB MIDI. USB audio output is optional: the
+composer uses its dispatcher when selected, and otherwise adds the MIDI-only
+adapter automatically. CF METER IDLE conflicts with its publisher. Consult the module and
 remix indexes for actual selections and proof levels before installing an image.
 Viewing does not build or flash firmware and needs no local OS image or project.
 

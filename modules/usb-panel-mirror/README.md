@@ -1,8 +1,11 @@
 # USB PANEL MIRROR
 
 Experimental read-only LCD, LED and physical-input snapshots over vendor EP0, beside USB
-MIDI and one existing audio output layout, or the exclusive
-[standalone adapter](../usb-panel-mirror-standalone/README.md). Original
+MIDI, with an optional existing audio output layout. Select **USB MIDI** and
+**USB PANEL MIRROR**. The composer uses the audio dispatcher when an output
+is selected; otherwise it automatically adds the
+[MIDI-only adapter](../usb-panel-mirror-standalone/README.md). No separate
+adapter selection is needed. Original
 ColdFire implementation: Sami Zeinelabdin. MKI cold boot was confirmed with the diagnostic cache wrapper on 8 Oct
 2026; PDBG13 subsequently passed 66 CRC-validated snapshots in 30 seconds
 on MKI/macOS, and the operator confirmed the visible panel works. Physical

@@ -146,8 +146,10 @@ class State:
         if not name:
             return
         r = registry.remix(name)
-        self.sel = set(r.modules)
-        self.order = list(r.modules)
+        # Dispatch is derived, never an editable choice saved in the composer.
+        requested = [k for k in r.modules if k != registry.PANEL_ADAPTER]
+        self.sel = set(requested)
+        self.order = requested
         # `fx1=()` means "stock's, unchanged" -- so the pane shows stock's
         # ten rather than an empty list, and saving it back writes `()` again.
         self.fx1 = list(r.fx1) or list(stock_fx1_default())
@@ -292,7 +294,7 @@ class State:
     @property
     def selected(self):
         """Selected modules in CHOOSER order (the remix's declared order)."""
-        return [self.mods[k] for k in self.order]
+        return registry.resolve_selected([self.mods[k] for k in self.order])
 
     @property
     def menu_modules(self):

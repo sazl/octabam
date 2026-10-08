@@ -115,8 +115,10 @@ physical elapsed time. The host uses a single cancellable worker
 and atomic cached views; its own connection incarnation prevents mixing leases
 across reconnects, even when firmware metadata repeats.
 
-USB MIDI is required, with exactly one dispatcher owner (a selected supported
-audio output or USB PANEL MIRROR STANDALONE). CF METER IDLE conflicts because
+USB MIDI is required. Module selection resolves exactly one dispatcher owner:
+a selected supported audio output, or the automatically added USB PANEL MIRROR
+STANDALONE adapter when no audio output is selected. Legacy explicit adapter
+selections are removed when an audio output is present. CF METER IDLE conflicts because
 both own the priority-zero service loop. Feature-off images must retain their
 existing descriptors and dispatch behavior. A mirror-promising carrier missing
 symbols or handshake must fail; an unrelated feature-absent image can report an

@@ -219,6 +219,42 @@ def remix_path(name: str) -> pathlib.Path:
     return d / "remix.py" if d is not None else REMIXES_DIR / f"{name}.py"
 
 
+PANEL_ADAPTER = "USB PANEL MIRROR STANDALONE"
+PANEL_OUTPUTS = tuple("USB AUDIO OUT " + suffix for suffix in
+                      ("MAIN", "MAIN CUE", "MASTER", "TRACKS", "TRACKS MAIN CUE"))
+
+
+def resolve_keys(keys) -> tuple[str, ...]:
+    """Choose the panel's dispatch adapter from the requested audio layout.
+
+    Keep explicit legacy selections working, including after audio is added.
+    The adapter precedes the mirror to retain existing MIDI-only placement.
+    Selections without the mirror are unchanged and still validated normally.
+    """
+    keys = tuple(keys)
+    if "USB PANEL MIRROR" not in keys:
+        return keys
+    if any(key in keys for key in PANEL_OUTPUTS):
+        return tuple(key for key in keys if key != PANEL_ADAPTER)
+    if PANEL_ADAPTER in keys:
+        return keys
+    index = keys.index("USB PANEL MIRROR")
+    return keys[:index] + (PANEL_ADAPTER,) + keys[index:]
+
+
+def resolve_selected(selected) -> list:
+    """Resolve a composer's modules with the same rules as the image build."""
+    selected = list(selected)
+    keys = tuple(mod.key for mod in selected)
+    resolved = resolve_keys(keys)
+    if resolved == keys:
+        return selected
+    by_key = {mod.key: mod for mod in selected}
+    if PANEL_ADAPTER in resolved and PANEL_ADAPTER not in by_key:
+        by_key[PANEL_ADAPTER] = modules()[PANEL_ADAPTER]
+    return [by_key[key] for key in resolved]
+
+
 def remix(name: str | None):
     """Load the remix's remix.py (remix_path) and return its REMIX. None refuses."""
     if not name:
@@ -233,6 +269,7 @@ def remix(name: str | None):
     if not hasattr(mod, "REMIX"):
         raise SystemExit(f"{f} defines no REMIX")
     r = mod.REMIX
+    r = dataclasses.replace(r, modules=resolve_keys(r.modules))
     known = modules()
     for k in r.modules:
         if k not in known:

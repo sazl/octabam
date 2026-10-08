@@ -1,9 +1,11 @@
 # USB PANEL MIRROR STANDALONE
 
-The mutually exclusive MIDI-only control adapter for
-[USB PANEL MIRROR](../usb-panel-mirror/README.md). Select USB MIDI, the
-core mirror and this adapter together; selecting any audio output module
-is an explicit named conflict. It adds no audio descriptors or processing.
+The automatic MIDI-only control adapter for
+[USB PANEL MIRROR](../usb-panel-mirror/README.md). Select USB MIDI and the
+core mirror; the composer adds this adapter only without a USB audio output.
+With audio, the audio module provides dispatch instead. Legacy explicit
+adapter selections remain supported and are omitted when audio is selected.
+It adds no audio descriptors or processing and is hidden from the module picker.
 
 Original implementation: Sami Zeinelabdin. The EP0 descriptor-page fix
 follows markandrus/octemu's existing USB audio code and credits that
