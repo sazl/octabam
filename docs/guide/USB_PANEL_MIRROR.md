@@ -1,7 +1,9 @@
 # Viewing a physical Octatrack panel over USB
 
 The browser can display LCD and available LED state from firmware that exports
-USB PANEL MIRROR. This is an experimental, read-only viewer. The usual
+USB PANEL MIRROR. Schema 2 additionally mirrors physical keys, encoder
+pushes/turn direction and the calibrated crossfader. Schema 1 images such
+as PDBG13 provide LCD/LED state only. This is an experimental, read-only viewer. The usual
 `make panel REMIX=<name>` still runs the emulator and its controls. The native
 macOS launcher remains emulator-only; use a browser for the physical viewer.
 
@@ -17,8 +19,14 @@ Viewing does not build or flash firmware and needs no local OS image or project.
 
 Protocol/transport tests use synthetic data. Boot capture and the initial EP0
 probe have ColdFire port evidence; they do not establish physical USB driver
-access, simultaneous audio, hardware timing or performance. There is no physical
-unit or flash evidence from this implementation. Final port validation passed
+access, simultaneous audio, hardware timing or performance. MKI diagnostic flashes on 8 Oct 2026 reproduced a boot-logo hang and
+restored full-feature boot with instruction-cache synchronization.
+Earlier images received INFO but showed malformed string descriptors and
+snapshot-BEGIN stalls. PDBG13 (BUILD=81) boots with USB connected and
+delivered a complete capture plus 66 validated snapshots over 30 seconds
+with no reported errors on the physical MKI/macOS setup. The hardware
+backend also served LCD PNG and LEDs over HTTP. The operator confirmed the visible panel works. Reconnect behavior and
+audio coexistence remain unmeasured. Final port validation passed
 80 audio-profile runs, four standalone runs and three negative controls with
 the scoped digital checks described in the
 [design and proof limits](../firmware/USB_PANEL_MIRROR.md).
@@ -81,9 +89,12 @@ same serial. Restart after changing your intended selector.
 A static LCD can remain unchanged while INFO heartbeats confirm contact. Status
 separates last contact, last accepted snapshot and last display change; an old
 snapshot is not evidence of a live device. Polling defaults to 5 Hz and respects
-firmware minimum/rate limits. Ten visible updates per second is a target, not a
-claim for this five-poll profile. Latency, audio headroom and driver coexistence
-on hardware remain unmeasured.
+firmware minimum/rate limits. USB work counts within the negotiated interval,
+so a 200 ms interval does not add another 200 ms after an acquisition. Slow
+acquisitions never trigger catch-up bursts. The browser reads cached hardware
+input status every 100 ms; emulator status retains its 350 ms interval.
+Ten visible updates per second is a target, not a claim for this five-poll
+profile. Physical button-to-screen latency and audio headroom remain unmeasured.
 
 | response or symptom | meaning and next action |
 |---|---|
@@ -100,6 +111,7 @@ Hardware HTTP reads are limited to `/`, `/skin.js`, `/screen.png`, `/screen.txt`
 `/status`, `/map`, `/leds`, and `/leds/stream`. Every known emulator operation is
 refused, including GET routes that mutate state. Keys, encoders, fader, transport,
 project/card operations, uploads, audio controls and captures are unavailable.
+Physical input observation does not enable browser control of the unit.
 
 ## Bounded diagnostic probe
 
@@ -118,5 +130,46 @@ captures as CI fixtures. Browser acceptance used Chromium 151 on Linux with
 Node 24 and a fake HTTP source, including two tabs and legacy emulator controls.
 Encoded mirror exchanges also passed through the real SnapshotClient,
 HardwareBackend and HTTP handler; these are host integration checks. Native
-AppKit compilation/runtime and physical Linux/macOS/Windows acceptance remain
-unmeasured.
+AppKit compilation/runtime and physical Linux/Windows acceptance remain
+unmeasured. MKI/macOS snapshot and HTTP delivery passed on PDBG13;
+visual comparison and reconnect acceptance remain open.
+
+
+## Iterate with a connected Octatrack
+
+Build in an isolated worktree with its own `out/emu`, shared native `.venv`
+and `vendor`, and your own extracted stock MAIN. Keep all firmware artifacts
+local. For your personal `szpanel` remix, the loop is:
+
+```sh
+export PATH="$PWD/.venv/bin:$PATH"
+make check-remix REMIX=szpanel BUILD=83
+make check REMIX=usb-panel-standalone BUILD=83
+make image REMIX=szpanel BUILD=83 VERSION=PDBG15 SYX=/absolute/path/OCTATRACK_OS1.40C.syx
+```
+
+Choose a fresh BUILD for each flash. The check exercises the port and USB
+device model; it cannot reproduce physical CPU caches or USB timing. Copy
+the generated card image in USB DISK MODE, eject, install via OS UPGRADE,
+and power-cycle with USB unplugged first. Recovery from a logo hang uses
+the startup MIDI upgrade path and a USB-to-DIN MIDI interface; the onboard
+USB connection is not the firmware-update transport. See
+[BUILDING.md](BUILDING.md) for the flash and recovery procedure.
+
+After confirming cold boot, connect USB in normal operating mode. Run one
+client at a time:
+
+```sh
+.venv/bin/python tools/hw/usb_panel.py --verbose info
+.venv/bin/python tools/hw/usb_panel.py capture --output out/panel-body.dat
+.venv/bin/python tools/hw/usb_panel.py watch --duration 30 > out/panel-watch.jsonl
+make panel-hardware
+```
+
+Inspect errors inside the watch log; exit zero alone does not prove success.
+Compare the browser with the physical LCD and LEDs while changing screens,
+then test idle display, reconnect and normal playback. Stop the viewer
+before another capture client acquires the lease. The physical USB backend
+is read-only and provides snapshots, not memory inspection, breakpoints,
+hot-loading or panel key injection. Boot regressions still require an
+operator-observed power cycle.

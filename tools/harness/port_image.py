@@ -227,9 +227,18 @@ def launch_args(argv, *, runtime_elf=None):
     park, resume, entry = s['mirror_idle_park'], s['mirror_idle_resume'], s['pm_idle_entry']
     if target != entry:
         raise ValueError('image idle hook does not select linked panel idle entry')
-    expected = b'\x4e\xb9\x40\x09\x8a\x2c\x70\x01\x23\xc0' + s['pm_live'].to_bytes(4, 'big')
+    expected = b'\x4e\xb9\x40\x09\x8a\x2c'
+    if 'pm_input_seed' in s:
+        # Schema-2 entry seeds holds after final init, before the publisher.
+        # Require the exact BSR.w to this image's associated linked helper.
+        runtime.code(s['pm_input_seed'], 2)
+        displacement = s['pm_input_seed'] - (entry + 8)
+        if not -32768 <= displacement <= 32767:
+            raise ValueError('panel input seed is outside BSR.w range')
+        expected += b'\x61\x00' + displacement.to_bytes(2, 'big', signed=True)
+    expected += b'\x70\x01\x23\xc0' + s['pm_live'].to_bytes(4, 'big')
     if resume != entry + len(expected) or runtime.code(entry, len(expected)) != expected:
-        raise ValueError('panel idle entry instruction mismatch')
+        raise ValueError('panel idle entry/seed instruction mismatch')
     if park != resume + 4 or runtime.code(resume, 2) != b'\x61\x00':
         raise ValueError('panel resume instruction is not the publisher BSR.w')
     if resume + 2 + int.from_bytes(runtime.code(resume + 2, 2), 'big', signed=True) != s['pm_publish']:

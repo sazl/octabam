@@ -2,8 +2,10 @@
 
 INFO heartbeats count as contact even when a screen is static. Reads have a
 250 ms transfer timeout and SnapshotClient's at-most-two-second lease budget.
-Polling waits at least the requested period, firmware minimum, and advertised
-publication period. Contact is stale after max(2 seconds, three poll periods).
+Polling starts are separated by at least the requested period, firmware
+minimum, and advertised publication period. Transfer and rendering time count
+towards that interval; a slow acquisition does not trigger catch-up bursts.
+Contact is stale after max(2 seconds, three poll periods).
 Poll rates must also have a finite reciprocal no larger than threading.TIMEOUT_MAX;
 unrepresentable worker waits are rejected before startup or device access.
 Recovery backs off from 0.5 to 5 seconds; three corrupt/timed-out acquisitions
@@ -25,7 +27,7 @@ import uuid
 _PANEL_DIR = Path(__file__).resolve().parent
 if str(_PANEL_DIR) not in sys.path:
     sys.path.insert(0, str(_PANEL_DIR))
-from panel_backend import LedSnapshot, ViewSnapshot, render_link
+from panel_backend import InputSnapshot, LedSnapshot, ViewSnapshot, input_payload, render_link
 from panel_link import PanelLink
 _ROOT = _PANEL_DIR.parents[1]
 if str(_ROOT) not in sys.path:
@@ -101,6 +103,7 @@ class HardwareBackend:
         # construction and serialization belong outside it.
         with self._lock:
             view, identity, info, header = self._view, self._identity, self._info, self._header
+            accepted_key = self._accepted_key
             state, error = self._state, self._error
             capabilities = self._capabilities
             connection_id, generation = self._connection_id, self._device_generation
@@ -130,6 +133,9 @@ class HardwareBackend:
             "last_contact_at": contact_at, "last_snapshot_at": snapshot_at,
             "last_display_change_at": display_at,
             "known_state": {"led_rows": list(rows), "led_ids": list(ids), "backlight": backlight},
+            "inputs": input_payload(view.inputs) if view and view.inputs is not None else None,
+            "inputs_epoch": accepted_key[1] if view and view.inputs is not None and accepted_key else None,
+            "inputs_connection_id": accepted_key[0] if view and view.inputs is not None and accepted_key else None,
             "error": {"code": error[0], "message": error[1]} if error else None,
             "diagnostics": [{"at": at, "code": code, "message": message}
                             for at, code, message in diagnostics],
@@ -148,6 +154,8 @@ class HardwareBackend:
             capabilities.add("leds")
         if info.capabilities & protocol.BACKLIGHT_SUPPORTED:
             capabilities.add("backlight")
+        if info.capabilities & protocol.INPUT_SUPPORTED:
+            capabilities.add("input_observation")
         return frozenset(capabilities)
 
     def _set_state(self, state, error=None):
@@ -174,12 +182,12 @@ class HardwareBackend:
         # All transfer validation lives in SnapshotClient/protocol. Decode a
         # fresh candidate and independently check the decoder consumed only
         # the complete canonical view, never history or partial state.
+        summary = completed.summary
         link = PanelLink()
-        link.feed(completed.body)
+        link.feed(completed.body[:summary.output_length])
         if (link.pending or link.stats["unknown"] or link.stats["lcd_badcol"] or
                 link.commands or link.stats["lcd_blocks"] != protocol.LCD_BLOCK_COUNT):
             raise mirror.TransportError("protocol_error", "Canonical body did not decode to 128 complete LCD blocks")
-        summary = completed.summary
         if (tuple(sorted(link.led_rows)) != summary.led_rows or
                 tuple(sorted(link.leds)) != summary.led_ids or
                 (link.backlight is not None) != summary.backlight_known):
@@ -190,6 +198,12 @@ class HardwareBackend:
             capabilities.add("leds")
         if summary.backlight_known:
             capabilities.add("backlight")
+        inputs = None
+        if summary.inputs is not None:
+            observation = summary.inputs
+            inputs = InputSnapshot(observation.known, observation.fader, observation.keys,
+                                   observation.press_counts, observation.encoder_counts)
+            capabilities.add("input_observation")
         leds = None
         if summary.led_rows or summary.led_ids or summary.backlight_known:
             bits = bytes(link.led_rows.get(row, 0) for row in range(protocol.MAX_LED_ROWS)) if summary.led_rows else b""
@@ -202,7 +216,7 @@ class HardwareBackend:
             changed_at = now if old is None or old.png != png else old.display_changed_at
             sequence = 1 if old is None else old.generation + 1
             self._view = ViewSnapshot(png, text, leds, sequence, self._model(completed.info),
-                                      frozenset(capabilities), now, changed_at)
+                                      frozenset(capabilities), now, changed_at, inputs)
             self._capabilities = self._view.capabilities
             self._accepted_key = (connection_id, completed.identity.epoch, completed.identity.generation,
                                   completed.info.capabilities, completed.info.model)
@@ -255,6 +269,17 @@ class HardwareBackend:
                             self._capabilities = frozenset(("screen",)) if self._view else frozenset()
                     if self._stop.is_set():
                         break
+                    with self._lock:
+                        acquisition_state, acquisition_error = self._state, self._error
+                        if (acquisition_state == "live" and self._last_contact_mono is not None
+                                and time.monotonic() - self._last_contact_mono
+                                > max(CONTACT_TIMEOUT_S, 3 * self._period)):
+                            acquisition_state = "stale"
+                            acquisition_error = ("timeout", "No successful device contact within the liveness threshold")
+                            self._state, self._error = acquisition_state, acquisition_error
+                    # Discovery/reconnect is outside the polling cadence.
+                    # Anchor at INFO so a slow open cannot cause a burst.
+                    poll_started = time.monotonic()
                     response, info = client.info()
                     self._contact(response, info)
                     ready = (info.valid_lcd_blocks == protocol.LCD_BLOCK_COUNT and
@@ -268,14 +293,27 @@ class HardwareBackend:
                                info.capabilities, info.model)
                         with self._lock:
                             unchanged = self._accepted_key == key
-                        if unchanged:
+                            same_session = (self._view is not None and self._accepted_key is not None
+                                            and self._accepted_key[:2] == key[:2]
+                                            and self._accepted_key[3:] == key[3:])
+                        if unchanged and acquisition_state == "live":
                             self._set_state("live")
                         else:
-                            self._set_state("syncing")
+                            # Keep a verified observation live during routine
+                            # capture only when acquisition began live. Recovery
+                            # retains its stale state/error until publication;
+                            # new sessions also need a fresh baseline.
+                            if same_session:
+                                self._set_state(acquisition_state, acquisition_error)
+                            else:
+                                self._set_state("syncing", acquisition_error)
                             completed = client.snapshot(response, info, stop_event=self._stop)
                             self._publish(completed, incarnation)
                         failures, retry = 0, RETRY_INITIAL_S
-                    if self._stop.wait(self._period):
+                    # Count successful transfer/rendering work towards the
+                    # negotiated start-to-start period. Anchor each cycle on
+                    # its actual start so slow cycles never accumulate a debt.
+                    if self._stop.wait(max(0, poll_started + self._period - time.monotonic())):
                         break
                 except Exception as error:
                     if self._stop.is_set():

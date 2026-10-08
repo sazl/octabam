@@ -29,7 +29,9 @@ Capture only complete, accepted reports; no interrupt-time allocation,
 waiting, USB operation, CRC computation or full snapshot copy is allowed.
 
 The stock parser handles key rows 0x20–0x27, encoder rows 0x30–0x36 and
-the crossfader at 0x40. Key row 7 contains encoder pushes A–F and LEVEL.
+the crossfader at 0x40. MKI also receives its physical fader through
+dedicated UART2 callbacks, so observation must cover the shared normal
+and factory-inverted callback commits. Key row 7 contains encoder pushes A–F and LEVEL.
 Retain eight held-key row masks and a 16-bit counter for each rising edge
 among their 64 bits. Increment counters only for a change from released to
 held; repeated reports do not count as new presses. Obtain an initial key
@@ -44,7 +46,9 @@ directions even if opposite turns would cancel in a signed total.
 Capture the fader after the stock calibration calculation, rather than
 assuming the raw ADC is linear. Normalize its calibrated value to 0=A/left,
 127=B/right using the existing firmware-to-browser convention. Mark it
-unknown until a calibrated report has been observed. Unknown is not zero.
+unknown until a calibrated report has been observed, unless the stock last
+position already holds a validated value in 0..127 at final initialization.
+The stock sentinel remains unknown. Unknown is not zero.
 
 All input changes increment the snapshot's coherence generation. Input
 state participates in the existing optimistic copy and final generation
@@ -87,14 +91,23 @@ cached state and never start extra USB acquisitions. Advertise input
 observation separately from emulator control capability: hardware remains
 read-only and no key injection endpoint is enabled. Carry cached input data
 in `/status`; preserve existing LED streaming and emulator behavior.
+Hardware input status polls use a 100 ms browser interval; emulator and
+failed-request polls retain 350 ms. The USB worker includes transfer work
+inside its negotiated start-to-start interval, anchored immediately before
+INFO after discovery, without catch-up bursts or faster USB starts.
+`inputs_epoch` and `inputs_connection_id` identify the accepted input
+snapshot session, independently of a newer INFO heartbeat. Ordinary same-session acquisitions keep the
+verified cached view live; initial and reconnect acquisition remain syncing.
+A failed acquisition remains stale through retries until a newly verified
+snapshot succeeds, so retry heartbeats cannot revive obsolete held keys.
 
-Each tab tracks its own counter baseline keyed by backend instance and
-firmware epoch. Its first observation displays current holds and fader
+Each tab tracks its own counter baseline keyed by backend instance,
+accepted USB connection incarnation and firmware epoch. Its first observation displays current holds and fader
 position without replaying historic taps or turns. A changed press counter
 produces a 200 ms highlight even if the key is already released. Held keys
 stay highlighted until released. Knob pushes use the same behavior.
 Directional encoder counters drive a visible clockwise/counterclockwise
-indicator and corresponding cap rotation; both directions within one poll
+indicator with no absolute-position marker or accumulated cap angle; both directions within one poll
 are shown as activity in both directions without claiming their order.
 Turn indicators expire after 250 ms without fresh activity. Re-reading the
 same snapshot must not repeat an animation. Modular differences handle

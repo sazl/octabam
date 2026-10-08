@@ -1,5 +1,36 @@
 # Changelog
 
+## USB panel PDBG14 — 8 Oct 2026
+
+The operator tested personal MKI `szpanel` BUILD82/PDBG14 and reported
+that the panel looked good, with three follow-ups: endless-encoder markers
+should be removed, the physical fader handle remained absent, and input
+updates had visible latency. Cached physical status showed schema2 with
+key/encoder observations but no fader observation (`known=5`, `fader=null`).
+The initial fader hook covered panel UART1 parsing; MKI's separate UART2
+callbacks bypassed it. These reports establish the missing physical path;
+the PDBG14 synthetic panel-parser checks did not prove that path.
+
+## USB panel boot investigation — 8 Oct 2026
+
+Personal MKI `szpanel` diagnostic images flashed by the operator (USB
+disconnected requested; explicitly confirmed for PDBG0): PDBG0/3/4/5/6/7
+hung on the Elektron logo; PDBG1/2/8/9/10 booted. PDBG8 moved PDBG6's
+identical minimal handoff from freshly unpacked DRAM into OS image space.
+PDBG9 added IC-only synchronization before DRAM entry; PDBG10 applied that
+same synchronization to the full panel feature. This isolates missing
+instruction-cache coherence at the early handoff. Full-feature PDBG10
+answered physical INFO but showed malformed string descriptors and BEGIN
+stalls. PDBG11 confirmed the source cache fix with USB connected. PDBG13
+(BUILD=81) also boots with USB connected and fixes snapshot delivery: EP0
+IN initialization disables automatic extra zero-length packets, and idle
+requests skip unnecessary asynchronous endpoint flushes. On the physical
+MKI, one complete capture and 66 snapshots over 30 seconds passed coverage
+and CRC validation with no reported errors; the hardware HTTP backend
+served status, LCD PNG and LED state successfully. No audio quality,
+MKI timing or MKII hardware claim follows from these probes.
+
+
 One entry per image that reached a unit, newest first; `Unreleased` is what
 main carries that no flashed image has yet. The version the panel shows is
 `BUILD` (`make image BUILD=N`); git tags exist for images 28, 29, 38, 42

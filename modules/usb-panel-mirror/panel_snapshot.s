@@ -80,10 +80,19 @@ pm_copy_checkpoint:
         cmpi.l  #256,%d2
         bcs.s   .Llevels
         tst.l   pm_backlight_known
-        beq.s   .Lcrc
+        beq.s   .Linputs
         move.l  #0xb7,%d0
         move.b  %d0,(%a2)+
         move.b  pm_backlight,(%a2)+
+.Linputs:
+        lea     pm_inputs,%a3
+        moveq   #OTPM_INPUT_RECORD_SIZE/4-1,%d0
+.Linput_copy:
+        move.l  (%a3)+,(%a2)+
+        subq.l  #1,%d0
+        bpl.s   .Linput_copy
+        .global pm_input_copy_checkpoint
+pm_input_copy_checkpoint:
 .Lcrc:
         lea     pm_body,%a0
         move.l  %a2,%d2
@@ -122,6 +131,8 @@ pm_copy_checkpoint:
         tst.l   pm_active
         beq.s   .Labandon
         move.l  %d7,pm_body_generation
+        move.l  pm_output_generation,%d0
+        move.l  %d0,pm_body_output_generation
         move.l  %d2,pm_body_length
         move.l  %a5,pm_body_crc
         move.l  %a6,pm_body_flags
@@ -162,6 +173,7 @@ pm_flags:
         .global pm_idle_entry, mirror_idle_resume, mirror_idle_park
 pm_idle_entry:
         jsr     0x40098a2c          | displaced final init, exactly once
+        bsr.w   pm_input_seed
         moveq #1,%d0
         move.l %d0,pm_live
 mirror_idle_resume:
@@ -200,6 +212,8 @@ pm_last_publish: .long -13200000
 pm_next_token: .long 0
 pm_body_length: .long 0
 pm_body_crc: .long 0
+.global pm_body_output_generation
+pm_body_output_generation: .long 0
 pm_body_generation: .long 0
 pm_body_flags: .long 0
 pm_body: .space OTPM_BODY_STORAGE_CAPACITY,0

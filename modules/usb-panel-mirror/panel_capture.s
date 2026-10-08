@@ -90,6 +90,7 @@ pm_accept:
         move.b  %d0,(%a1,%d4.l)
         addq.l  #1,pm_level_count
 .Lcommit:
+        addq.l  #1,pm_output_generation | separate UART oracle, no input commits
         addq.l  #1,pm_generation
         beq.s   pm_invalidate       | fail closed on generation exhaustion
 .Ldone:
@@ -129,6 +130,8 @@ pm_invalidate:
         .global pm_row_count, pm_level_count
 pm_row_count: .long 0
 pm_level_count: .long 0
+.global pm_output_generation
+pm_output_generation: .long 0
 pm_generation: .long 0
 pm_lcd_count: .long 0
 pm_active: .long 1

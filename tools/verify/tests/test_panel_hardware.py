@@ -296,6 +296,10 @@ assert script_worker.ViewSnapshot is panel_backend.ViewSnapshot
         view = self.live(backend)
         self.assertIsNone(view.leds)
         self.assertEqual(view.capabilities, frozenset(("screen",)))
+        self.assertIsNone(view.inputs)
+        self.assertIsNone(backend.status()["inputs"])
+        self.assertIsNone(backend.status()["inputs_epoch"])
+        self.assertIsNone(backend.status()["inputs_connection_id"])
 
     def test_invalid_candidates_preserve_last_good_view(self):
         for mode in ("crc", "truncation", "offset", "mixed_generation", "mixed_token", "mixed_epoch", "bound"):

@@ -103,12 +103,12 @@
   .k.skin:hover { background:rgba(255,255,255,.05) !important; }
   .knob.skin { background:transparent; box-shadow:none; }
   .knob.skin::before { content:none; }
-  .knob.skin .cap { display:none; }
+  .knob.skin .cap, .knob.live .cap { display:none; }
   .knob.skin.live:hover, .knob.skin.pot:hover { box-shadow:0 0 0 2px rgba(232,178,58,.35); }
   #fbed.skin-bed { background:transparent; box-shadow:none; }
   #view { flex:1; position:relative; overflow:hidden; }
   #stage { position:absolute; left:50%; top:8px; width:1250px; height:682px; overflow:hidden; transform-origin:50% 0;
-           transform-origin:50% 50%; transform:translate(-50%,-50%) scale(1);
+           transform:translate(-50%,0) scale(1);
            border-radius:18px; user-select:none; -webkit-user-select:none;
            background:linear-gradient(#1c1c1e, #101011);
            box-shadow:inset 0 1px 0 rgba(255,255,255,.09), inset 0 0 0 1px #000, 0 24px 70px rgba(0,0,0,.85); }
@@ -225,9 +225,8 @@
   .k.held::after { content:""; position:absolute; inset:0; border-radius:inherit;
                    background:rgba(98,224,106,.45); pointer-events:none; }
 
-  /* knobs: dark cap, lighter skirt ring, white indicator at 12 o'clock.
-     The cap is rotated in JS: a live encoder is ENDLESS like the unit's (15 deg per
-     detent, the indicator just goes round, see turn()); VOLUME is a pot and stays put. */
+  /* Knobs: endless encoders have no position marker. Physical movement
+     flashes direction glyphs; VOLUME is a pot with a position indicator. */
   .knob { border-radius:50%; background:radial-gradient(circle at 50% 38%, #4e4e50, #3a3a3c 55%, #262628);
           box-shadow:0 0 0 1px #1a1a1b, 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12); }
   .knob::before { content:""; position:absolute; inset:-5px; border-radius:50%; border:3px solid #5c5c5e;
@@ -251,6 +250,13 @@
   #screen { left:540px; top:182px; width:283px; height:144px; image-rendering:pixelated; image-rendering:crisp-edges;
             background:var(--lcd); display:block; transition:opacity .3s; }
   #screen.dim { opacity:.3; }
+  /* Observed input activity is independent of writable emulator controls. */
+  .k.skin.physical-held, .k.skin.physical-tap { background:rgba(255,210,58,.28) !important; }
+  .knob.physical-held, .knob.physical-tap { box-shadow:0 0 0 3px rgba(255,210,58,.7); }
+  .knob .direction { display:none; position:absolute; top:-19px; color:#ffd23a; font-size:18px; line-height:18px; pointer-events:none; }
+  .knob .direction.cw { right:-12px; }
+  .knob .direction.ccw { left:-12px; }
+  .knob.turn-cw .direction.cw, .knob.turn-ccw .direction.ccw { display:block; }
   #note { left:540px; top:182px; width:283px; height:144px; display:none; align-items:center; justify-content:center;
           color:#d8d5cc; font-size:11px; letter-spacing:.06em; text-transform:uppercase; text-align:center; pointer-events:none; }
   #note.show { display:flex; }
@@ -321,7 +327,7 @@
 <div id="view"><div id="stage">
   <div id="strip"></div>
   <div id="bezel"></div>
-  <img id="screen" src="/screen.png" alt="LCD" draggable="false">
+  <img id="screen" alt="" aria-label="LCD" draggable="false">
   <div id="note"><span></span></div>
   <div id="fbed"><div class="slit"></div></div>
   <div id="fhandle"></div>
@@ -337,7 +343,7 @@ const STAGE_W = 1250, STAGE_H = 682;   // the skin's viewBox (tools/panel/skin/g
 // Source identity is authoritative; no controls or emulator polling before it.
 const PORT_CAPS = ["screen", "leds", "backlight", "controls", "midi", "memory", "emulator", "samples", "card", "audio"];
 let source = null, capabilities = new Set(), sourceReadOnly = true, hasVerifiedFrame = false;
-const can = cap => capabilities.has(cap) && (!sourceReadOnly || ["screen", "leds", "backlight"].includes(cap));
+const can = cap => capabilities.has(cap) && (!sourceReadOnly || ["screen", "leds", "backlight", "input_observation"].includes(cap));
 const endpointCap = path => {
   if (["/", "/skin.js", "/status", "/map", "/screen.png", "/screen.txt"].includes(path)) return null;
   if (path === "/leds" || path === "/leds/stream") return "leds";
@@ -357,7 +363,7 @@ function sourceStatus(s) {
   const port = next === "port" && (!backendPresent || s.backend === "port");
   const hardware = next === "hardware" && (!backendPresent || s.backend === "hardware");
   const caps = port ? (Array.isArray(s.capabilities) ? s.capabilities : PORT_CAPS)
-    : hardware ? (Array.isArray(s.capabilities) ? s.capabilities : []).filter(c => ["screen", "leds", "backlight"].includes(c)) : [];
+    : hardware ? (Array.isArray(s.capabilities) ? s.capabilities : []).filter(c => ["screen", "leds", "backlight", "input_observation"].includes(c)) : [];
   const before = [...capabilities].sort().join(","), after = [...caps].sort().join(",");
   const readOnly = !port || s.read_only === true;
   const identified = port ? "port" : hardware ? "hardware" : null;
@@ -369,6 +375,7 @@ function sourceStatus(s) {
   }
   if (!hardware || !caps.includes("screen")) cancelPhysicalImage();
   sourceReadOnly = readOnly; source = identified; capabilities = new Set(caps);
+  if (!hardware) clearPhysicalInputs("unknown", true);
   if (changed || !can("controls")) cancelControls();
   if (!can("audio")) {
     clearTimeout(MON.statusTimer); clearTimeout(MON.armTimer);
@@ -463,8 +470,14 @@ for (const [id, sid] of Object.entries(SKIN_KEYS)) {
 for (const [id, sid] of Object.entries(SKIN_KNOBS)) {
   const n = KN[sid]; if (!n) continue;
   const k = el("knob skin" + (id === "volume" ? " pot" : " live"), n.cx, n.cy, 2 * n.r, 2 * n.r);
-  k.dataset.id = id; k.dataset.pos = 0;
-  const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
+  k.dataset.id = id;
+  if (id === "volume") {
+    const cap = document.createElement("div"); cap.className = "cap"; k.append(cap);
+  }
+  if (id !== "volume") for (const [direction, glyph] of [["cw", "↻"], ["ccw", "↺"]]) {
+    const indicator = document.createElement("span"); indicator.className = "direction " + direction;
+    indicator.textContent = glyph; indicator.setAttribute("aria-hidden", "true"); k.append(indicator);
+  }
 }
 // the LED elements applyLeds() drives, kept (hidden) for their state; the skin mirrors them
 for (const id of Object.keys(SKIN_LEDS)) { const d = el("led", -20, -20, 7, 7); d.id = "led-" + id; }
@@ -689,10 +702,8 @@ window.addEventListener("blur", () => { shiftHeld = false; aHeld = false; zHeld 
 //
 // The unit's encoders are ENDLESS and so are these (13 Sep 2026; until then
 // each knob was bounded to -64..+63 as an emulator convenience): no end
-// stops, every detent goes out, the indicator just keeps going round (15
-// deg per detent, 24 per turn, drawn from the net detents sent since the
-// page loaded -- an angle, not a value; the firmware clamps each PARAMETER
-// at its own range, as the unit does). The firmware honours the full
+// stops, every detent goes out; the firmware clamps each PARAMETER at its
+// own range, as the unit does. The firmware honours the full
 // +/-127 per report (STRT 0..127: +25 -> 25, -25 -> 0, +127 -> 127, -127
 // -> 0, 11 Sep 2026); a burst of wheel is capped at +-64 per report here.
 // DOUBLE-CLICK = the parameter this encoder controls on the CURRENT page
@@ -700,7 +711,7 @@ window.addEventListener("blur", () => { shiftHeld = false; aHeld = false; zHeld 
 // the detents that reach the page descriptor's default: KEYMAP.md, the
 // "Encoders" section of 13 Sep 2026, tools/panel/param_map.json); on a
 // SETUP page, a menu or the MIXER the server answers ok:false and sends
-// nothing. The indicator returns to 12 o'clock as the cue.
+// nothing. Endless encoders show relative direction only.
 // DOUBLE-CLICK WITH A TRIG KEY HELD (Shift-click latches it, or the key is
 // down) = the encoder's PUSH SWITCH instead: /knob/press sends the panel's
 // own report for it -- key-matrix row 0x27, bit = the encoder (A-F = 0-5,
@@ -709,25 +720,20 @@ window.addEventListener("blur", () => { shiftHeld = false; aHeld = false; zHeld 
 // on the unit (manual 12.5, "remove a single parameter lock"). Measured:
 // the lock byte 0x45 -> 0xff, the inverted box back to normal, the trig
 // kept; a push with no lock there sets one at the current value.
-const DEG_PER_DETENT = 15, REPORT_MAX = 64;
+const REPORT_MAX = 64;
 const signed = n => (n > 0 ? "+" : "") + n;
-function drawKnob(el) {
-  el.querySelector(".cap").style.transform = `rotate(${+el.dataset.pos * DEG_PER_DETENT}deg)`;
-}
-document.querySelectorAll(".knob.live").forEach(drawKnob);   // all start at 12 o'clock
 const pending = new Map();
 function turn(el, detents) {
   if (!can("controls")) return;
   if (!detents) return;
   const row = rowOfKnob(el);
   if (row == null) { hint(`"${el.dataset.id}" knob is not in key_map.json`); return; }
-  el.dataset.pos = +el.dataset.pos + detents;
-  drawKnob(el);
+  pulseInput(el, detents > 0 ? "turn-cw" : "turn-ccw", 250);
   const p = pending.get(el) || {n: 0, timer: 0};
   p.n = Math.max(-REPORT_MAX, Math.min(REPORT_MAX, p.n + detents));
   if (!p.timer) p.timer = setTimeout(() => {
     pending.delete(el);
-    sendKnob(row, p.n, ` (${signed(+el.dataset.pos)} detents since load)`);
+    sendKnob(row, p.n);
   }, 80);
   pending.set(el, p);
 }
@@ -744,7 +750,6 @@ async function resetKnob(el) {
   hint(`${el.dataset.id}: back to init…`);
   const r = await panelFetch(`/knob/reset?row=${hex(row)}`).then(x => x.json());
   if (r.ok) {
-    el.dataset.pos = 0; drawKnob(el);
     hint(`${el.dataset.id}: ${r.name} on ${r.page} (T${r.track}) ${r.before === r.after ? "already at init" : `${r.before} → ${r.after}`} (init ${r.init}, ${r.sent.length} report${r.sent.length === 1 ? "" : "s"} sent)`);
   } else hint(`${el.dataset.id}: not reset — ${r.note}`);
 }
@@ -818,10 +823,25 @@ document.addEventListener("mouseup", () => { drag = null; });
 const FADER = {pos: null, want: null, timer: 0, drag: false, focus: false, scenes: ""};
 const FBED = $("#fbed"), FHANDLE = $("#fhandle");
 function drawFader() {
+  if (source === "hardware") {
+    const hd = document.getElementById("fader-handle"), pos = physicalInputs.fader;
+    FBED.dataset.inputState = physicalInputs.faderState;
+    if (hd) {
+      hd.style.visibility = pos == null || physicalInputs.faderState === "unknown" ? "hidden" : "visible";
+      if (pos != null) {
+        const travel = (((window.SKIN || {}).fader || {}).travel || {}).max || 166;
+        hd.setAttribute("transform", `translate(${pos / 127 * travel} 0)`);
+      }
+    }
+    FHANDLE.title = FBED.title = pos == null || physicalInputs.faderState === "unknown" ? "" : `CROSSFADER at ${pos} · ${physicalInputs.faderState} (0 = scene A, 127 = scene B)`;
+    return;
+  }
+  const hd = document.getElementById("fader-handle"); if (hd) hd.style.visibility = "visible";
+  delete FBED.dataset.inputState;
   if (!can("controls")) { FHANDLE.title = FBED.title = ""; return; }
   if (FADER.pos == null) { FHANDLE.title = FBED.title = "CROSSFADER"; return; }
   const travel = (((window.SKIN || {}).fader || {}).travel || {}).max || 166;
-  const hd = document.getElementById("fader-handle");   // the skin's handle: translate in x, 0 = far left
+  // the skin's handle: translate in x, 0 = far left
   if (hd) hd.setAttribute("transform", `translate(${FADER.pos / 127 * travel} 0)`);
   FHANDLE.title = FBED.title = `CROSSFADER at ${FADER.pos} (0 = scene A, 127 = scene B; = MIDI CC 48)${FADER.scenes} — drag, wheel (Shift ×8) or ←/→ after a click; the firmware morphs the scene locks`;
 }
@@ -1508,6 +1528,76 @@ function startLedStream() {
   };
 }
 
+// Physical counters are per-tab activity baselines, never absolute knob positions.
+const physicalInputs = {identity:null, presses:null, encoders:null,
+  fader:null, faderState:"unknown", timers:new Map()};
+function clearInputActivity(el, cls) {
+  const timers = physicalInputs.timers.get(el);
+  if (timers) { clearTimeout(timers[cls]); delete timers[cls]; }
+  el.classList.remove(cls);
+}
+function pulseInput(el, cls, duration) {
+  clearInputActivity(el, cls);
+  el.classList.add(cls);
+  const timers = physicalInputs.timers.get(el) || {};
+  physicalInputs.timers.set(el, timers);
+  timers[cls] = setTimeout(() => clearInputActivity(el, cls), duration);
+}
+function clearPhysicalInputs(state, resetFader = false) {
+  for (const el of document.querySelectorAll(".k,.knob.live")) {
+    el.classList.remove("physical-held");
+    for (const cls of ["physical-tap", "turn-cw", "turn-ccw"]) clearInputActivity(el, cls);
+  }
+  physicalInputs.timers.clear();
+  physicalInputs.identity = null;
+  physicalInputs.presses = physicalInputs.encoders = null;
+  if (resetFader) physicalInputs.fader = null;
+  physicalInputs.faderState = state;
+  drawFader();
+}
+function renderPhysicalInputs(s) {
+  if (source === "hardware" && s.connection_state !== "live") { clearPhysicalInputs("stale"); return; }
+  if (source !== "hardware" || !can("input_observation") || !s.inputs) {
+    clearPhysicalInputs("unknown"); return;
+  }
+  const input = s.inputs, epoch = Number.isInteger(s.inputs_epoch) ? s.inputs_epoch : (s.protocol || {}).epoch;
+  const connection = Number.isInteger(s.inputs_connection_id) ? s.inputs_connection_id : (s.protocol || {}).connection_id;
+  if (typeof s.instance_id !== "string" || !s.instance_id || !Number.isInteger(epoch) || !Number.isInteger(connection) || connection < 1) {
+    clearPhysicalInputs("unknown"); return;
+  }
+  const identity = JSON.stringify([s.instance_id, connection, epoch]);
+  if (identity !== physicalInputs.identity) { clearPhysicalInputs("unknown", true); physicalInputs.identity = identity; }
+  const keyKnown = !!(input.known & 1), encKnown = !!(input.known & 4);
+  for (const el of document.querySelectorAll(".k,.knob.live")) {
+    const row = el.classList.contains("live") ? rowOfKnob(el) : null;
+    const cell = el.classList.contains("k") ? keyOf(el) : row == null ? null : [0x27, row - 0x30];
+    if (keyKnown && cell) {
+      const index = (cell[0] - 0x20) * 8 + cell[1];
+      el.classList.toggle("physical-held", !!(input.keys[cell[0] - 0x20] & (1 << cell[1])));
+      if (physicalInputs.presses && ((input.press_counts[index] - physicalInputs.presses[index]) & 0xffff))
+        pulseInput(el, "physical-tap", 200);
+    } else {
+      el.classList.remove("physical-held"); clearInputActivity(el, "physical-tap");
+    }
+    if (!el.classList.contains("live")) continue;
+    if (encKnown && row != null && physicalInputs.encoders) {
+      const index = row - 0x30;
+      const cw = (input.encoder_counts[index][0] - physicalInputs.encoders[index][0]) & 0xffff;
+      const ccw = (input.encoder_counts[index][1] - physicalInputs.encoders[index][1]) & 0xffff;
+      if (cw) pulseInput(el, "turn-cw", 250);
+      if (ccw) pulseInput(el, "turn-ccw", 250);
+      // Show relative activity only: endless encoders have no position marker.
+    } else if (!encKnown) {
+      clearInputActivity(el, "turn-cw"); clearInputActivity(el, "turn-ccw");
+    }
+  }
+  physicalInputs.presses = keyKnown ? input.press_counts.slice() : null;
+  physicalInputs.encoders = encKnown ? input.encoder_counts.map(pair => pair.slice()) : null;
+  if (input.known & 2) physicalInputs.fader = input.fader;
+  physicalInputs.faderState = input.known & 2 && input.fader != null ? "live" : "unknown";
+  drawFader();
+}
+
 // ---------------- status poll ----------------
 let lastSeq = -1, lastFault = null;
 const physicalImage = {pending:null, wanted:null, status:null, failed:false, retryAt:0};
@@ -1548,6 +1638,7 @@ async function poll() {
     const s = await panelFetch("/status").then(x => x.json());
     if (!s || typeof s !== "object") throw new Error("invalid status");
     sourceStatus(s);
+    renderPhysicalInputs(s);
     if (source !== "port") { renderPhysicalStatus(s); return; }
     $("#imginfo").textContent = (s.image || "").split("/").pop();
     const phase = s.phase || (s.booted ? "ready" : "booting");
@@ -1574,12 +1665,14 @@ async function poll() {
     // Transport failure revokes controls; preserve the last verified display.
     sourceStatus({source, read_only:true, capabilities:[]});
     $("#phase").textContent = "server unreachable"; $("#phase").className = "failed";
-    $("#note").classList.add("show"); $("#note span").textContent = hasVerifiedFrame ? "server unreachable — last verified frame" : "server unreachable — waiting for a verified frame";
+    clearPhysicalInputs("stale");
+    $("#note").classList.remove("show"); $("#note span").textContent = "";
+    $("#screen").classList.remove("dim");
     document.body.classList.add("readonly");
     for (const selector of ["#card", "#hp", "#monbtn", ".knob.pot"]) $(selector).title = "";
     $("#monbtn").disabled = true;
     refreshMapped(); drawFader();
-  } finally { setTimeout(poll, 350); }
+  } finally { setTimeout(poll, source === "hardware" && can("input_observation") ? 100 : 350); }
 }
 let pollN = 0;
 
@@ -1595,20 +1688,18 @@ function renderPhysicalStatus(s) {
   }
   if (key != null && can("screen") && key !== lastSeq && !physicalImage.pending && Date.now() >= physicalImage.retryAt)
     loadPhysicalImage(key, s);
-  const current = key != null && key === lastSeq;
-  const state = deviceState === "live" && !current ? (physicalImage.failed ? "image unavailable" : "syncing") : deviceState;
+  const state = deviceState === "live" && physicalImage.failed ? "image unavailable" : deviceState;
   const identity = s.device || {}, protocol = s.protocol || {};
   const device = identity.serial || identity.selector || identity.topology || "unknown device";
   const proto = protocol.version || (protocol.major != null ? `${protocol.major}.${protocol.minor || 0}` : "unknown");
   $("#imginfo").textContent = `${device} · model ${s.model || "unknown"} · build ${s.build || "unknown"} · protocol ${proto}`;
-  const ph = $("#phase"); ph.textContent = state;
+  const ph = $("#phase"); ph.textContent = state === "syncing" ? "" : state;
   ph.className = state === "live" ? "ready" : ["connecting", "syncing", "busy"].includes(state) ? "busy" : "failed";
   $("#rt").textContent = "";
   $("#fault").textContent = s.error ? `${s.error.code}: ${s.error.message}` : "";
-  const live = current && state === "live";
-  $("#screen").classList.toggle("dim", !live);
-  $("#note").classList.toggle("show", !live);
-  $("#note span").textContent = live ? "" : hasVerifiedFrame ? `${state} — last verified frame` : `${state} — waiting for a verified frame`;
+  $("#screen").classList.remove("dim");
+  $("#note").classList.remove("show");
+  $("#note span").textContent = "";
   const time = t => t == null ? "unknown" : new Date(typeof t === "number" ? t * 1000 : t).toLocaleTimeString();
   hint(`contact ${time(s.last_contact_at)} · snapshot ${time(s.last_snapshot_at)} · display change ${time(s.last_display_change_at)}`);
   if (can("leds") && Object.keys(mapLeds).length && !ledStreamOn) panelFetch("/leds").then(r => r.json()).then(applyLeds).catch(() => {});
@@ -1620,11 +1711,12 @@ async function loadMap() {
     mapKeys = m.keys || {}; mapKnobs = m.knobs || {}; mapLeds = m.leds || {};
   } catch (e) {}
   refreshMapped();
+  if (source === "hardware" && physicalImage.status) renderPhysicalInputs(physicalImage.status);
 }
 
 sourceStatus({});
 $("#source").textContent = "IDENTIFYING SOURCE";
-$("#note").classList.add("show"); $("#note span").textContent = "identifying source — waiting for a verified frame";
+$("#note").classList.remove("show"); $("#note span").textContent = "";
 $("#monbtn").disabled = true;
 drawBar(); loadMap(); poll();
 </script>

@@ -82,7 +82,7 @@ class AssembledHostTests(unittest.TestCase):
         self.assertNotEqual(second.png, first.png)
         self.assertEqual(self.transport.info_generations[:6], [128, 128, 128, 129, 129, 129])
         self.assertEqual(self.transport.calls.count(protocol.REQUEST_BEGIN), 4)  # PENDING + READY per body
-        self.assertEqual(self.transport.calls.count(protocol.REQUEST_READ), 80)  # two validated 1280-byte bodies
+        self.assertEqual(self.transport.calls.count(protocol.REQUEST_READ), 92)  # two validated 1448-byte schema-2 bodies
         backend.close()
         self.assertTrue(self.transport.closed)
 
@@ -96,5 +96,5 @@ class AssembledHostTests(unittest.TestCase):
         self.assertEqual([r['changed'] for r in reports], [True, False, False, True])
         self.assertEqual([r['snapshot']['generation'] for r in reports if 'snapshot' in r], [128, 129])
         self.assertEqual(self.transport.calls.count(protocol.REQUEST_BEGIN), 4)
-        self.assertEqual(self.transport.calls.count(protocol.REQUEST_READ), 80)
+        self.assertEqual(self.transport.calls.count(protocol.REQUEST_READ), 92)
         self.assertTrue(self.transport.closed)

@@ -12,7 +12,8 @@ class RuntimeComparison:
 
 # panel_capture.s initializes these objects in .data. pm_after_loader drains
 # accepted preloader bytes, then the normal taps update the shadow; pm_idle_entry
-# sets pm_live before the port reports HANDOFF. Sizes are their assembly storage
+# sets pm_live and seeds the input baseline before the port reports HANDOFF.
+# pm_input_state excludes the immutable input marker/version bytes. Sizes are their assembly storage
 # extents, not a whole .data exemption: padding, pm_lengths, snapshot buffers,
 # USB replies and every other module's data remain compared byte-for-byte.
 MIRROR_BOOT_FIELDS = (
@@ -22,7 +23,7 @@ MIRROR_BOOT_FIELDS = (
     ("pm_backlight", 1), ("pm_pending", 1), ("pm_needed", 1), ("pm_message", 10),
     ("pm_lcd", 1024), ("pm_lcd_seen", 128), ("pm_row_values", 32),
     ("pm_row_seen", 32), ("pm_level_values", 256), ("pm_level_seen", 256),
-    ("pm_live", 4),
+    ("pm_live", 4), ("pm_output_generation", 4), ("pm_input_state", 166),
 )
 
 

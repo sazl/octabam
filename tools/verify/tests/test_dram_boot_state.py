@@ -16,12 +16,13 @@ class BootRuntimeState(unittest.TestCase):
             'pm_backlight': 1, 'pm_pending': 1, 'pm_needed': 1, 'pm_message': 10,
             'pm_lcd': 1024, 'pm_lcd_seen': 128, 'pm_row_values': 32,
             'pm_row_seen': 32, 'pm_level_values': 256, 'pm_level_seen': 256,
-            'pm_live': 4,
+            'pm_live': 4, 'pm_output_generation': 4, 'pm_input_state': 166,
         }
         offset = 128
         for name, size in self.fields.items():
             self.symbols[name] = (self.base + offset, 'd' if name in ('pm_pending', 'pm_needed', 'pm_message') else 'D')
-            offset += size + 1  # padding must remain immutable, too
+            offset += size + 3  # padding must remain immutable, too
+        self.symbols['pm_inputs'] = (self.symbols['pm_input_state'][0] - 2, 'D')
         self.symbols['pm_lengths'] = (self.base + offset, 'd')
         self.symbols['pm_body'] = (self.base + offset + 256, 'D')
 
@@ -36,12 +37,13 @@ class BootRuntimeState(unittest.TestCase):
             got[offset:offset + size] = b'\x81' * size
         result = self.compare(got)
         self.assertTrue(result.ok)
-        self.assertEqual(len(result.differences), 1777)
-        self.assertEqual(sum(count for _name, _start, _size, count in result.permitted), 1777)
+        self.assertEqual(len(result.differences), 1947)
+        self.assertEqual(sum(count for _name, _start, _size, count in result.permitted), 1947)
         self.assertEqual(result.unexpected, ())
 
     def test_even_one_code_constant_snapshot_or_adjacent_byte_change_is_rejected(self):
-        offsets = [8, self.symbols['pm_lengths'][0] - self.base,
+        offsets = [8, self.symbols['pm_inputs'][0] - self.base,
+                   self.symbols['pm_inputs'][0] - self.base + 1, self.symbols['pm_lengths'][0] - self.base,
                    self.symbols['pm_body'][0] - self.base]
         offsets += [self.symbols[name][0] - self.base + size for name, size in self.fields.items()]
         for offset in offsets:

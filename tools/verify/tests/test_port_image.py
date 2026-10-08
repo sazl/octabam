@@ -114,6 +114,33 @@ class PortImage(unittest.TestCase):
         self.assertEqual(result, self.argv + ['--main-park', '0x47000012:0x4700000e'])
         self.assertNotIn('--main-park', self.argv)
 
+    def input_fixture(self):
+        # An invented BSR.w seeds inputs after the exact stock final-init JSR.
+        original=self.raw
+        for name in ('mirror_idle_resume','mirror_idle_park','pm_publish','pm_live'):
+            self.symbols[name]+=4
+        self.symbols['pm_input_seed']=self.base+len(original)+4
+        displacement=self.symbols['pm_input_seed']-(self.base+8)
+        self.raw=(original[:6]+b'\x61\x00'+displacement.to_bytes(2,'big',signed=True)+
+                  original[6:].replace((self.base+28).to_bytes(4,'big'),self.symbols['pm_live'].to_bytes(4,'big'))+b'\x4e\x75')
+        self.write_fixture()
+
+    def test_input_seed_entry_calls_exact_linked_seed_before_idle_markers(self):
+        self.input_fixture()
+        self.assertEqual(self.launch()[-2:],['--main-park','0x47000016:0x47000012'])
+        for offset in (0,6,8,10):
+            original=self.raw
+            raw=bytearray(original);raw[offset]^=1;self.raw=bytes(raw)
+            self.write_fixture()
+            with self.subTest(offset=offset),self.assertRaisesRegex(ValueError,'instruction|seed'):
+                self.launch()
+            self.raw=original
+        self.write_fixture()
+        self.symbols['pm_input_seed']-=2
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError,'seed'):
+            self.launch()
+
     def test_explicit_equal_markers_preserved_and_mismatch_rejected(self):
         args = self.argv + ['--main-park', '1191182354:1191182350']
         self.assertEqual(self.launch(args), args)

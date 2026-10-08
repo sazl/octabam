@@ -192,3 +192,25 @@ stock Part routines and the CC dispatch as stock, so none is needed (`git show 2
   question.
 - `0x46000000..0x47502c10`: measure with samples loaded and the recorder
   running before placing there.
+
+
+### USB panel instruction-cache handoff
+
+USB PANEL MIRROR owns an additional pinned OS-image unit at
+`0x400d7a00..0x400d7b0c` (`panel_cache.s`). Its three pointer slots at
+`0x400d7b00/04/08` are declared symbol refs to `pm_accept`, `_edata` and
+`pm_after_loader`; the early handoff enters this unit before fetching
+unpacked DRAM instructions. The build still asserts that its whole unit
+is free and composes its declared claims. This costs 268 OS-image bytes
+including bridge alignment, with no shared-loader or arena changes.
+MKI hardware probe evidence and limits are recorded in
+[USB_PANEL_MIRROR.md](../firmware/USB_PANEL_MIRROR.md#mki-bootcache-finding--8-oct-2026).
+
+
+Schema-2 USB panel input state lives in the module's initialized DRAM unit
+`panel_input`, with three asserted stock parser detours and no new arena
+reservation or ROM cave. Its 168-byte input record extends canonical body
+capacity to 2,026 bytes within the existing 2,048-byte buffer. A separate
+four-byte output generation and four-byte frozen output generation preserve
+UART-boundary verification; the bounded observer introduces no heap, task
+stack, or absolute free-RAM claim.

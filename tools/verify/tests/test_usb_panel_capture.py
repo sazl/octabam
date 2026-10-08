@@ -37,6 +37,8 @@ class Capture(unittest.TestCase):
         (work/'remix.inc').write_text((ROOT/'modules/usb-panel-mirror/protocol.inc').read_text())
         subprocess.run(['m68k-elf-as', '-I', str(work), '-mcpu=54455', '-o', str(work/'capture.o'), str(SOURCE)], check=True, capture_output=True)
         objects=[str(work/'capture.o')]
+        subprocess.run(['m68k-elf-as','-I',str(work),'-mcpu=54455','-o',str(work/'input.o'),str(ROOT/'modules/usb-panel-mirror/panel_input.s')],check=True,capture_output=True)
+        objects.append(str(work/'input.o'))
         subprocess.run(['m68k-elf-as','-I',str(work),'-mcpu=54455','-o',str(work/'boot.o'),str(ROOT/'modules/usb-panel-mirror/panel_boot.s')],check=True,capture_output=True)
         objects.append(str(work/'boot.o'))
         for name in getattr(self,'extra_sources',()):
@@ -199,6 +201,7 @@ class Snapshot(Capture):
         self.assertEqual(self.integer('pm_lease_state'),2)
         body=self.read('pm_body',self.integer('pm_body_length'))
         expected=wire[:1280]+b'\x21\x08\xa1\x80\x31\x00\x3f\xff\xb7\x00'
+        expected+=b'\xb8\x01'+bytes(166)
         self.assertEqual(body,expected)
         self.assertEqual(self.integer('pm_body_crc'),zlib.crc32(expected))
         # A fresh lease on unchanged state still produces a complete snapshot.
@@ -232,13 +235,39 @@ class Control(Snapshot):
         self.uc.mem_map(0x4001d000,0x1000)
         self.uc.mem_write(0x4001d498,b'\x4e\x75')
         from unicorn import UC_HOOK_MEM_READ
-        self.uc.hook_add(UC_HOOK_MEM_READ,lambda uc,*args:uc.mem_write(0xfc0b01b4,bytes(4)),begin=0xfc0b01b4,end=0xfc0b01b7)
+        self.flush_hook=self.uc.hook_add(UC_HOOK_MEM_READ,lambda uc,*args:uc.mem_write(0xfc0b01b4,bytes(4)),begin=0xfc0b01b4,end=0xfc0b01b7)
         # CPU accesses the private reply through the uncached SDRAM alias.
         self.uc.mem_map(0x8100000,0x20000)
     def request(self,req,value=0,index=0,length=32,bm=0xc0):
         self.uc.mem_write(0x46c8ce08,struct.pack('<BBHHH',bm,req,value,index,length))
         self.call('pm_ctrl')
         return bytes(self.uc.mem_read(self.symbols['pm_reply']+0x8000000,64))
+    def test_idle_in_endpoint_needs_no_asynchronous_flush(self):
+        from unicorn import UC_HOOK_MEM_WRITE
+        # Unlike the port, the real controller need not complete a flush
+        # before the very next read. An already-idle endpoint needs no flush.
+        self.uc.hook_del(self.flush_hook)
+        writes=[]
+        hook=self.uc.hook_add(UC_HOOK_MEM_WRITE,lambda uc,access,addr,size,value,data:writes.append(value),begin=0xfc0b01b4,end=0xfc0b01b7)
+        raw=self.request(0x57,length=64)
+        self.uc.hook_del(hook)
+        self.assertEqual(raw[:4],b'OTPM')
+        self.assertEqual(raw[6:8],bytes([0,1]))
+        self.assertEqual(writes,[],'do not start an unnecessary asynchronous flush')
+
+    def test_busy_in_endpoint_flush_pending_preserves_reply_and_lease(self):
+        self.uc.hook_del(self.flush_hook)
+        reply=self.symbols['pm_reply']+0x08000000
+        original=bytes([0xa5])*64
+        self.uc.mem_write(reply,original)
+        self.uc.mem_write(0xfc0b01b8,struct.pack('>I',0x10000))
+        before=self.read('pm_lease_state',4)
+        self.request(0x58,value=42)
+        self.assertEqual(bytes(self.uc.mem_read(reply,64)),original)
+        self.assertEqual(self.read('pm_lease_state',4),before)
+        self.assertEqual(bytes(self.uc.mem_read(0xfc0b01b4,4)),struct.pack('>I',0x10000))
+        self.assertTrue(int.from_bytes(self.uc.mem_read(0xfc0b01c0,4),'big')&0x10000)
+
     def test_info_and_malformed_lengths(self):
         from usb_mirror_protocol import parse_response,parse_info,SetupRequest
         raw=self.request(0x57,length=64)

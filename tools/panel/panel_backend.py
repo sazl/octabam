@@ -29,6 +29,20 @@ class LedSnapshot:
 
 
 @dataclass(frozen=True)
+class InputSnapshot:
+    known: int
+    fader: int | None
+    keys: tuple[int, ...]
+    press_counts: tuple[int, ...]
+    encoder_counts: tuple[tuple[int, int], ...]
+
+    def __post_init__(self):
+        object.__setattr__(self, "keys", tuple(self.keys))
+        object.__setattr__(self, "press_counts", tuple(self.press_counts))
+        object.__setattr__(self, "encoder_counts", tuple(tuple(pair) for pair in self.encoder_counts))
+
+
+@dataclass(frozen=True)
 class ViewSnapshot:
     png: bytes
     text: str
@@ -38,10 +52,13 @@ class ViewSnapshot:
     capabilities: frozenset[str]
     snapshot_at: float
     display_changed_at: float
+    inputs: InputSnapshot | None = None
 
     def __post_init__(self):
         if self.leds is not None and not isinstance(self.leds, LedSnapshot):
             raise TypeError("leds must be an immutable LedSnapshot or None")
+        if self.inputs is not None and not isinstance(self.inputs, InputSnapshot):
+            raise TypeError("inputs must be an immutable InputSnapshot or None")
         object.__setattr__(self, "png", bytes(self.png))
         object.__setattr__(self, "capabilities", frozenset(self.capabilities))
 
@@ -96,3 +113,10 @@ def led_payload(leds: LedSnapshot) -> dict[str, object]:
     if leds.backlight is not None:
         payload["backlight"] = leds.backlight
     return payload
+
+
+def input_payload(inputs: InputSnapshot) -> dict[str, object]:
+    """Detach the cached observation for JSON readers; unknown fader is null."""
+    return {"known": inputs.known, "fader": inputs.fader,
+            "keys": list(inputs.keys), "press_counts": list(inputs.press_counts),
+            "encoder_counts": [list(pair) for pair in inputs.encoder_counts]}

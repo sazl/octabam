@@ -23,17 +23,17 @@ pm_ctrl:
         move.b 0x46c8ce0e,%d7
         cmpi.l #OTPM_HEADER_SIZE,%d7
         bcs.w .Lstall
-| Single nonblocking EP0-IN flush/check. A failed quiescence check leaves
-| reply bytes and leases untouched. No EP0 OUT/audio/MIDI register changes.
+| Avoid initiating an asynchronous flush on an already-idle endpoint.
+| If an old IN transfer remains, flush once and check without waiting.
+| Pending cancellation still stalls before touching reply bytes or leases.
+| No EP0 OUT/audio/MIDI register changes.
+        bsr.w .Lep0_in_busy
+        beq.s .Lquiet
         move.l #0x10000,%d0
         move.l %d0,0xfc0b01b4
-        move.l 0xfc0b01b4,%d0
-        move.l 0xfc0b01b0,%d1
-        or.l %d1,%d0
-        move.l 0xfc0b01b8,%d1
-        or.l %d1,%d0
-        btst #16,%d0
+        bsr.w .Lep0_in_busy
         bne.w .Lstall
+.Lquiet:
         lea pm_reply+0x08000000,%a2
         move.l %a2,%a0
         moveq #15,%d0
@@ -239,6 +239,16 @@ pm_ctrl:
         rts
 .Lunhandled:
         moveq #0,%d0
+        rts
+
+| Return Z only when EP0 IN has no pending flush, prime or active buffer.
+.Lep0_in_busy:
+        move.l 0xfc0b01b4,%d0
+        move.l 0xfc0b01b0,%d1
+        or.l %d1,%d0
+        move.l 0xfc0b01b8,%d1
+        or.l %d1,%d0
+        btst #16,%d0
         rts
 
 | USB reset/session end retire transport only, never reset physical state.

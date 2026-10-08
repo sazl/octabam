@@ -117,7 +117,7 @@ class ProtocolTests(unittest.TestCase):
         for n in range(64):
             with self.subTest(n=n), self.assertRaises(p.ProtocolError):
                 p.parse_info(p.parse_response(raw[:n],request=p.info_request()))
-        mutations = [(0,0),(4,2),(5,1),(6,6),(7,2),(8,0),(31,0x40)]
+        mutations = [(0,0),(4,2),(5,2),(6,6),(7,2),(8,0),(31,0x40)]
         for index, value in mutations:
             bad=bytearray(raw); bad[index]=value
             if index==8: bad[8:12]=bytes(4)

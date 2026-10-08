@@ -1,4 +1,4 @@
-"""Firmware-free browser event checks; optional existing Chromium/Node instrument.
+"""Firmware-free browser event checks; optional existing Chromium/Chrome and Node instrument.
 
 The fake HTTP source serves only synthetic status and generated PNG images. No device,
 firmware, package install, or npm dependency is used. Missing browser tooling is
@@ -26,7 +26,7 @@ class PanelBrowserTests(unittest.TestCase):
     def test_capabilities_guard_real_browser_events(self):
         self.run_browser('capabilities')
 
-    def test_no_frame_status_failure_keeps_waiting_label(self):
+    def test_no_frame_status_failure_reports_header_error(self):
         self.run_browser('no-frame-failure')
 
     def test_delayed_audio_status_cannot_restore_hardware_controls(self):
@@ -44,13 +44,29 @@ class PanelBrowserTests(unittest.TestCase):
     def test_late_png_cannot_replace_new_publication_or_emulator_source(self):
         self.run_browser('late-image')
 
+    def test_physical_inputs_holds_taps_turns_fader_and_tab_baselines(self):
+        self.run_browser('inputs')
+
+    def test_quiet_refresh_keeps_verified_pixels_bright_without_overlay(self):
+        self.run_browser('quiet-refresh')
+
+    def test_known_fader_is_visible_inside_scaled_panel_and_moves(self):
+        print(self.run_browser('fader-geometry').strip())
+
+    def test_cached_hardware_inputs_have_bounded_browser_poll_latency(self):
+        print(self.run_browser('poll-latency').strip())
+
     def run_browser(self, mode):
         if os.name != 'posix':
             self.skipTest('optional Chromium process-group instrument requires a POSIX host')
-        chromium = shutil.which('chromium') or shutil.which('chromium-browser')
+        chromium = (os.environ.get('PANEL_BROWSER') or shutil.which('chromium') or shutil.which('chromium-browser')
+                    or shutil.which('google-chrome'))
+        if not chromium:
+            mac_chrome = pathlib.Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+            chromium = str(mac_chrome) if mac_chrome.is_file() else None
         node = shutil.which('node')
         if not chromium or not node:
-            self.skipTest('real browser instrument requires existing Chromium and Node 22+; no dependencies installed')
+            self.skipTest('real browser instrument requires existing Chromium/Chrome and Node 22+; no dependencies installed')
         if subprocess.run([node, '-p', 'typeof WebSocket'], capture_output=True, text=True).stdout.strip() != 'function':
             self.skipTest('existing Node lacks built-in WebSocket')
         skin_dir = tempfile.TemporaryDirectory(prefix='panel-skin-')
@@ -91,6 +107,13 @@ class PanelBrowserTests(unittest.TestCase):
                         if key in q:
                             state[key] = q[key][0] if key == 'instance_id' else int(q[key][0])
                     body = b'{}'
+                elif path == '/input-fixture':
+                    for key, value in json.loads(q['data'][0]).items():
+                        if key == 'epoch':
+                            state['protocol']['epoch'] = value
+                        else:
+                            state[key] = value
+                    body = b'{}'
                 elif path == '/image-gate':
                     image_gate.clear() if q.get('hold') == ['1'] else image_gate.set()
                     body = b'{}'
@@ -112,7 +135,7 @@ class PanelBrowserTests(unittest.TestCase):
                     elif path == '/skin.js':
                         body = skin
                     elif path == '/status':
-                        payload = dict(state, backend=state['source'], read_only=state['source'] == 'hardware', capabilities=['screen'] if state['source'] == 'hardware' else ['screen','leds','controls','emulator','samples','card','audio'], model=None, device={'serial':'fake-only'}, build='synthetic', last_contact_at=time.time(), last_snapshot_at=time.time(), last_display_change_at=1, phase='ready', booted=True)
+                        payload = dict(state, backend=state['source'], read_only=state['source'] == 'hardware', capabilities=state.get('capabilities', ['screen']) if state['source'] == 'hardware' else ['screen','leds','controls','emulator','samples','card','audio'], model=None, device={'serial':'fake-only'}, build='synthetic', last_contact_at=time.time(), last_snapshot_at=time.time(), last_display_change_at=1, phase='ready', booted=True)
                         if state['source'] == 'legacy':
                             payload.pop('source'); payload['backend'] = 'port'
                         body = b'{invalid' if state['connection_state'] == 'server_error' else json.dumps(payload).encode()
@@ -121,7 +144,7 @@ class PanelBrowserTests(unittest.TestCase):
                         if not image_gate.wait(10):
                             self.send_error(504, 'test image gate timed out'); return
                     elif path == '/map':
-                        body = json.dumps({'keys':{'func':[37,5]},'knobs':{'level':48,'A':49},'leds':{}}).encode()
+                        body = (ROOT / 'tools/panel/key_map.json').read_bytes()
                     elif path == '/audio/status':
                         if not audio_gate.wait(10):
                             self.send_error(504, 'test audio gate timed out'); return
@@ -176,6 +199,7 @@ class PanelBrowserTests(unittest.TestCase):
             server.server_close()
             thread.join()
             skin_dir.cleanup()
+        return run.stdout
 
 
 class NativeSourcePolicyInspection(unittest.TestCase):

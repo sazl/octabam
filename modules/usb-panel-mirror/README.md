@@ -1,12 +1,15 @@
 # USB PANEL MIRROR
 
-Experimental read-only LCD and LED snapshots over vendor EP0, beside USB
+Experimental read-only LCD, LED and physical-input snapshots over vendor EP0, beside USB
 MIDI and one existing audio output layout, or the exclusive
 [standalone adapter](../usb-panel-mirror-standalone/README.md). Original
-ColdFire implementation: Sami Zeinelabdin. No hardware or native USB host
-coexistence claim has been established. Shipped remix selections are unchanged.
+ColdFire implementation: Sami Zeinelabdin. MKI cold boot was confirmed with the diagnostic cache wrapper on 8 Oct
+2026; PDBG13 subsequently passed 66 CRC-validated snapshots in 30 seconds
+on MKI/macOS, and the operator confirmed the visible panel works. Physical
+input mirroring requires the next diagnostic image and hardware acceptance;
+audio/driver coexistence remains unmeasured. Shipped remix selections are unchanged.
 
-`protocol.json` is the authoritative version 1.0 contract; `protocol.inc`
+`protocol.json` is the authoritative version 1.1 contract; `protocol.inc`
 is generated from it. Requests are exactly device-recipient vendor IN
 `c0/57` INFO, `c0/58` BEGIN, `c0/59` READ and `c0/5a` RELEASE. Existing
 `55` output counters and `56` input counters keep their owners. The current
@@ -14,6 +17,26 @@ advertised response ceiling is 64 bytes, minimum poll interval 200 ms,
 lease 1,000 ms, and publication ceiling 10 Hz. The conservative polling
 profile provides at most five fresh polls per second; physical latency
 and ten visible updates per second remain unmeasured targets.
+
+## Physical inputs
+
+Schema 2 adds a fixed 168-byte input record to the frozen LCD/LED body.
+Key masks distinguish held buttons from LEDs. Per-button press counters
+retain short taps, and per-encoder clockwise/counterclockwise counters
+retain turns between polls. Encoder push switches use key row 7. The fader
+uses the stock calibrated result, normalized to A/left=0 and B/right=127;
+it seeds from the validated stock last position when available, otherwise
+stays unknown until a calibrated report arrives. Both MKI UART2 callbacks
+and the MKII panel path are observed. Browser input
+observation is separate from writable emulator controls.
+
+The host still accepts schema 1, including PDBG13. Input mirroring needs
+schema-2 firmware. The maximum canonical body is 2,026 bytes in the
+existing 2,048-byte buffer. Counters wrap at 65,536; each browser tab
+establishes a fresh baseline on initial contact or a changed session,
+including transport reconnects that reuse the same firmware epoch.
+See the [design](../../docs/superpowers/specs/2026-10-08-usb-panel-input-design.md)
+for wire layout and acceptance requirements.
 
 ## Capture and initialization
 
@@ -40,6 +63,19 @@ drains those bytes into the loaded DRAM observer once, then publishes its
 function pointer. FIFO overflow sets a sticky fault and leaves the mirror
 unavailable; it never writes past the buffer or stops the real UART.
 This early handoff happens during boot, before the runtime service starts.
+
+The early handoff must also cross an instruction-cache boundary. The loader
+unpacks and hashes through the uncached **data** alias; that does not make
+new DRAM instructions coherent. MKI probes PDBG6/7 hung on a minimal DRAM
+stub, PDBG8 booted with identical instructions in OS space, and PDBG9/10
+booted after an OS-resident IC-only `CPUSHL` sweep (10 enables all panel
+hooks). `panel_cache.s` therefore runs before `pm_after_loader`, covering
+all cache sets/ways and the linked panel range through both SDRAM windows.
+It preserves registers, SR, entry SP, CACR/ACRs and the data cache. Its
+fixed OS cave is `0x400d7a00..0x400d7b0c`; three declared symbol refs bind
+the runtime range and handoff after linking. The port has no instruction
+cache model: its passing boot alone could not reveal this hardware defect.
+
 
 The observer retains 1,024 LCD bytes, 128 block-presence bytes, 32 LED row
 values/presence bytes each, 256 LED levels/presence bytes each, backlight,
@@ -73,7 +109,8 @@ READY as the last store. A raced attempt remains PENDING for a later
 opportunity; the USB interrupt never waits for the publisher. Frozen body
 storage is separate from the live shadow.
 
-A synthetic maximum 1,858-byte body takes 82,518 executed instructions.
+Before the input extension, a synthetic maximum 1,858-byte body took
+82,518 executed instructions.
 The longest masked publisher span is 20 instructions, with 29 masked
 instructions in total. These are emulator counts, not hardware timings.
 
@@ -82,7 +119,7 @@ The emulated gate explicitly configures those symbols with `--main-park`;
 only the branch is idle-skipped. A borrowed bench call returns to the
 resume point, so a static display still publishes after such calls.
 
-The current MAIN build uses 3,602 bytes of image-resident boot code/FIFO
+The pre-input MAIN build used 3,602 bytes of image-resident boot code/FIFO
 and 6,370 bytes of initialized DRAM object content before linker alignment:
 2,604 capture, 2,694 snapshot, 1,072 EP0. The private 64-byte reply is
 page-aligned, followed by 32 bytes of emulator-test scratch. Alignment can
@@ -206,3 +243,19 @@ belong in version control.
 The generated matrix uses BUILD=0, XBUS=1, SPEC=1; cleanup restores the
 requested carrier using the original caller's build environment, including
 BUILD, XBUS and SPEC, on both success and failure.
+
+PDBG11, built from the repository module fix (BUILD 80), was confirmed by
+the operator to boot on MKI with USB connected. This extends the boot
+evidence to the source-built fix; reliable USB snapshots, MKII hardware
+and audio coexistence remain separate acceptance checks.
+
+The EP0 IN initialization literal is now claimed at `0x4001d658` to set
+ZLT=1 before controller enable. This retires exact-wLength 64-byte panel
+replies without an automatic extra zero-length packet. The request guard
+checks quiescence first, flushing only an old active IN transfer and
+failing closed if cancellation remains pending. MKI PDBG12 improved
+spaced control responses. Combined PDBG13 boots with USB connected and
+passed physical MKI capture: all 128 LCD blocks, verified snapshot CRC,
+and 66 snapshots over 30 seconds with no reported errors. The physical
+viewer backend served LCD PNG and LED state successfully.
+[Physical EP0 evidence and termination limits](../../docs/firmware/USB_PANEL_MIRROR.md#physical-ep0-termination-investigation--8-oct-2026).

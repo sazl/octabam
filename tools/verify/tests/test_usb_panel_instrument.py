@@ -19,6 +19,100 @@ LCD=b''.join(bytes([0x10|p,c])+bytes([p+1])*8 for p in range(8) for c in range(0
 GOOD=(0x18200000).to_bytes(4,'little')+(0x18210000).to_bytes(4,'little')
 
 class Instrument(unittest.TestCase):
+    def test_mki_fader_gate_requires_actual_factory_selected_uart2_registration(self):
+        for factory,registered in ((0,0x40092fac),(1,0x40092f88)):
+            calls=[];pokes=[]
+            def call(address,*args):
+                calls.append((address,args))
+                return factory if address==0x4003232c else registered
+            bench=types.SimpleNamespace(call=call,poke=lambda address,data:pokes.append((address,data)))
+            evidence=gate.mki_fader_registration(bench,0x20000)
+            self.assertEqual(evidence['registered_callback'],registered)
+            self.assertEqual(evidence['factory_inverted'],bool(factory))
+            self.assertEqual(calls,[(0x4003232c,()),(0x20000,())])
+            self.assertEqual(pokes,[(0x20000,bytes.fromhex('2039460ba9844e75'))])
+        for factory,registered in ((0,0),(0,0x40092f88),(1,0x40092fac),(2,0x40092fac)):
+            bench=types.SimpleNamespace(call=lambda address,*args:factory if address==0x4003232c else registered,
+                                        poke=lambda *_:None)
+            with self.subTest(factory=factory,registered=registered),self.assertRaisesRegex(AssertionError,'factory|registration'):
+                gate.mki_fader_registration(bench,0x20000)
+
+    def test_frozen_reread_rejects_expired_lease_before_empty_payload_can_loop(self):
+        from tools.verify.tests import test_usb_panel_protocol as vectors
+        p=gate.wire
+        identity=p.SnapshotIdentity(**vars(vectors.identity(LCD)))
+        info=p.Info(**vars(vectors.info()))
+        calls=[]
+        def request(opcode,token,offset,length):
+            calls.append((opcode,token,offset,length))
+            return p.parse_response(vectors.wire(kind=3,status=4,generation=0),
+                                    request=p.read_request(token,offset,length))
+        with self.assertRaises(p.ProtocolError):
+            gate.read_frozen_body(request,identity,info)
+        self.assertEqual(len(calls),1,'expired lease must fail on its first response')
+
+    def test_frozen_reread_copies_exact_body_and_rejects_no_progress_or_mixed_identity(self):
+        from tools.verify.tests import test_usb_panel_protocol as vectors
+        p=gate.wire
+        identity=p.SnapshotIdentity(**vars(vectors.identity(LCD)))
+        info=p.Info(**vars(vectors.info()))
+        for fault in (None,'empty','offset','generation','oversize'):
+            calls=[]
+            def request(opcode,token,offset,length):
+                calls.append(offset)
+                payload=LCD[offset:offset+length-p.HEADER_SIZE]
+                if fault=='empty':payload=b''
+                if fault=='oversize':payload=LCD+bytes(1)
+                header=p.Header(1,0,p.Status.OK,p.Operation.READ,identity.epoch,
+                                identity.generation+(fault=='generation'),token,len(LCD),
+                                offset+(fault=='offset'),len(payload),identity.crc32,identity.frozen_flags)
+                return p.Response(header,payload)
+            with self.subTest(fault=fault):
+                if fault is None:
+                    self.assertEqual(gate.read_frozen_body(request,identity,info),LCD)
+                    self.assertEqual(calls,list(range(0,len(LCD),32)))
+                else:
+                    with self.assertRaises(p.ProtocolError):gate.read_frozen_body(request,identity,info)
+                    self.assertEqual(len(calls),1)
+
+    def test_midi_note_wait_accepts_prior_cc_but_requires_exact_aligned_note(self):
+        packets=iter((bytes.fromhex('0bb030400bb0307f'),bytes.fromhex('09903c64')))
+        bench=types.SimpleNamespace(ep_in=lambda ep,length:next(packets))
+        evidence=gate.require_midi_note(bench,bytes.fromhex('903c64'))
+        self.assertEqual(evidence['polls'],2)
+        self.assertEqual(evidence['packets'],['0bb030400bb0307f','09903c64'])
+        for packet in (b'\x09\x90\x3c',bytes.fromhex('0009903c64000000'),bytes.fromhex('09903d64')):
+            calls=[]
+            def read(ep,length):calls.append(1);return packet
+            with self.subTest(packet=packet.hex()),self.assertRaises(AssertionError):
+                gate.require_midi_note(types.SimpleNamespace(ep_in=read),bytes.fromhex('903c64'))
+            self.assertLessEqual(len(calls),8)
+
+    def test_input_sequence_rejects_reset_epoch_on_canonical_stale_and_fresh_ready(self):
+        from tools.verify.tests import test_usb_panel_protocol as vectors
+        p=gate.wire
+        frozen=p.SnapshotIdentity(**vars(vectors.identity(LCD)))
+        info=p.Info(**vars(vectors.info()))
+        for epoch in (frozen.epoch,frozen.epoch+1):
+            stale=p.parse_response(vectors.wire(kind=3,status=4,epoch=epoch,generation=0),
+                                   request=p.read_request(frozen.token,0,64))
+            # Reset-induced STALE is otherwise a fully canonical error reply.
+            self.assertEqual(stale.payload,b'')
+            self.assertFalse(any((stale.header.generation,stale.header.token,
+                                  stale.header.total_length,stale.header.offset,
+                                  stale.header.payload_length,stale.header.crc32)))
+            ready=p.parse_response(vectors.wire(kind=2,epoch=epoch,generation=frozen.generation+1,
+                                               token=frozen.token+1,total=len(LCD),crc=p.crc32(LCD)),
+                                   request=p.begin_request(99))
+            fresh=p.ready_identity(ready,connection_id=frozen.connection_id,info=info)
+            for observation in (stale.header,fresh):
+                with self.subTest(epoch=epoch,kind=type(observation).__name__):
+                    if epoch==frozen.epoch:
+                        gate.require_input_epoch(observation,frozen)
+                    else:
+                        with self.assertRaisesRegex(p.ProtocolError,'epoch'):
+                            gate.require_input_epoch(observation,frozen)
+
     def paired_bench(self,timeout=1):
         client,server=socket.socketpair();server.settimeout(1)
         # Wrap a real socket to observe write boundaries, not emulate replies.

@@ -360,6 +360,65 @@ def uac2_during_lease(b,request,cookie,service=None):
     return 1
 
 
+def read_frozen_body(request,identity,info,interleave=None):
+    """Read one lease with bounded progress and exact identity on every chunk."""
+    body=bytearray()
+    while len(body)<identity.total_length:
+        if interleave:interleave()
+        piece=request(0x59,identity.token,len(body),info.max_response)
+        if wire.ready_identity(piece,connection_id=identity.connection_id,info=info)!=identity:
+            raise wire.ProtocolError('frozen descriptor changed during body reread')
+        if piece.header.offset!=len(body) or not piece.payload:
+            raise wire.ProtocolError('frozen body reread made no progress at the requested offset')
+        if len(body)+len(piece.payload)>identity.total_length:
+            raise wire.ProtocolError('frozen body reread exceeds its descriptor')
+        body.extend(piece.payload)
+    return bytes(body)
+
+
+def require_input_epoch(observation,frozen_identity):
+    """Ordinary input activity and lease expiry cannot reset the USB session."""
+    if observation.epoch!=frozen_identity.epoch:
+        raise wire.ProtocolError(f'input sequence changed epoch {frozen_identity.epoch}->{observation.epoch}')
+
+
+def mki_fader_registration(bench,scratch):
+    """Read the real UART2 registration; do not substitute the UART1 parser."""
+    factory=bench.call(0x4003232c)
+    assert factory in (0,1),'unexpected stock factory predicate'
+    # Emulator-only authored getter: move.l (460ba984).l,d0; rts. The
+    # USB bench has no memory-read or UART2-input command. Module-owned
+    # scratch is never patched into an image or used by a physical client.
+    bench.poke(scratch,bytes.fromhex('2039460ba9844e75'))
+    registered=bench.call(scratch)
+    expected=0x40092f88 if factory else 0x40092fac
+    assert registered==expected,f'MKI UART2 callback registration mismatch: {registered:#x} != {expected:#x}'
+    return dict(registered_callback=registered,factory_inverted=bool(factory),
+                method='invoke registered stock UART2 callback; no UART2 wire/ADC timing claim')
+
+
+def require_midi_note(bench,midi,max_polls=8):
+    """Require an exact USB-MIDI note event after bounded legitimate traffic."""
+    assert len(midi)==3 and midi[0]&0xf0==0x90,'expected a complete note-on'
+    expected=b'\x09'+midi
+    packets=[]
+    for poll in range(max_polls):
+        packet=bench.ep_in(2,512)
+        packets.append(packet.hex())
+        print(f'  [INFO] MIDI EP2 IN poll {poll+1}: {packet.hex() or "empty"}',flush=True)
+        assert len(packet)%4==0,'partial USB-MIDI event: '+packet.hex()
+        events=[packet[i:i+4] for i in range(0,len(packet),4)]
+        for event in events:
+            cin=event[0]&15
+            assert event[0]<16 and cin>=2,'invalid USB-MIDI cable/CIN: '+event.hex()
+            if 8<=cin<=14:
+                assert event[1]&0xf0==cin<<4 and event[2]<128 and event[3]<128,'invalid channel event: '+event.hex()
+                if cin in (12,13):assert event[3]==0,'nonzero short-channel padding: '+event.hex()
+        if expected in events:
+            return dict(polls=poll+1,packets=packets)
+    raise AssertionError(f'exact USB-MIDI note {expected.hex()} absent in {max_polls} polls: {packets}')
+
+
 def symbols():
     nm=shutil.which('m68k-elf-nm') or shutil.which('m68k-linux-gnu-nm')
     if not nm: raise RuntimeError('missing ColdFire nm instrument')
@@ -369,10 +428,25 @@ def symbols():
 
 def run(image, modules, model, hs, out):
     sym=symbols()
-    for key in ('pm_ctrl','pm_reply','pm_publish','mirror_idle_park','mirror_idle_resume','pm_idle_entry'):
+    for key in ('pm_ctrl','pm_reply','pm_publish','mirror_idle_park','mirror_idle_resume','pm_idle_entry','pm_inputs','pm_output_generation','pm_body_output_generation'):
         if key not in sym: raise AssertionError('selected runtime lacks '+key)
     raw=image.read_bytes()
+    assert raw[0x1d658-0x400:0x1d65c-0x400] == bytes.fromhex('20400000'), 'EP0 IN still appends an automatic ZLP after full panel replies'
+    # The port has no CPU instruction-cache model: validate the mandatory
+    # OS-resident synchronization boundary structurally as well as booting.
+    nm=shutil.which('m68k-elf-nm') or shutil.which('m68k-linux-gnu-nm')
+    cache_elf=ROOT/'out/linked/usb-panel-mirror/panel_cache/u.elf'
+    cache_lines=subprocess.check_output([nm,str(cache_elf)],text=True).splitlines()
+    cache={p[2]:int(p[0],16) for p in (line.split() for line in cache_lines) if len(p)==3}
+    assert raw[0x512-0x400:0x518-0x400] == b'\x4e\xf9'+cache['pm_cache_handoff'].to_bytes(4,'big'), 'early handoff bypasses instruction-cache synchronization'
+    for slot,target in (('pm_cache_first','pm_accept'),('pm_cache_end','_edata'),('pm_cache_target','pm_after_loader')):
+        offset=cache[slot]-0x40000400
+        assert int.from_bytes(raw[offset:offset+4],'big')==sym[target], 'cache bridge mismatch: '+slot
     assert raw[0x1fc96-0x400:0x1fc9c-0x400] == b'\x4e\xf9'+sym['pm_idle_entry'].to_bytes(4,'big'), 'selected image lacks matching publisher detour'
+    for address,target in ((0x400923c0,'pm_key_tap'),(0x400924e4,'pm_encoder_tap'),(0x40092fc2,'pm_fader_tap'),(0x40092fa2,'pm_fader_inverted_tap')):
+        offset=address-0x40000400
+        assert raw[offset:offset+6]==b'\x4e\xf9'+sym[target].to_bytes(4,'big'),'selected image lacks accepted-input detour: '+target
+    assert raw[0x925fe-0x400:0x92604-0x400]==bytes.fromhex('4eb940092fac'),'UART1 fader callback call changed'
     assert sym['pm_reply']%4096==0,'private reply is not page aligned'
     audio=next((key for key in LAYOUTS if key in modules),None)
     ain=next((key for key in ('USB AUDIO IN AB','USB AUDIO IN CD','USB AUDIO IN ABCD') if key in modules),None)
@@ -381,8 +455,9 @@ def run(image, modules, model, hs, out):
     sock=f'/tmp/ot-panel-{os.getpid()}.sock'
     log=out/(tag+'.log');uart=out/(tag+'-uart.bin')
     dump=out/(tag+'-shadow');dump.mkdir(exist_ok=True)
-    fields={'pm_generation':4,'pm_lcd':1024,'pm_row_seen':32,'pm_row_values':32,'pm_level_seen':256,'pm_level_values':256,'pm_backlight':1,'pm_backlight_known':4}
+    fields={'pm_output_generation':4,'pm_body_output_generation':4,'pm_inputs':168,'pm_generation':4,'pm_lcd':1024,'pm_row_seen':32,'pm_row_values':32,'pm_level_seen':256,'pm_level_values':256,'pm_backlight':1,'pm_backlight_known':4}
     memory=';'.join(f'{sym[name]:#x},{size}={dump}/{name}.bin' for name,size in fields.items())
+    if model=='mki':memory+=f';0x460ba984,4={dump}/fixture_uart2_callback.bin'
     if audio:memory+=f';0x80000eb4,16={dump}/fixture_selectors.bin;0x80005f60,544={dump}/fixture_delay.bin'
     shared=ROOT/'out/verify_usb_panel';shared.mkdir(exist_ok=True)
     tree=shared/'cardtree';(tree/'OCTABAM/AUDIO').mkdir(parents=True,exist_ok=True)
@@ -412,12 +487,7 @@ def run(image, modules, model, hs, out):
             response=request(0x58,cookie & 65535,cookie>>16)
         assert response.header.status==wire.Status.OK,f'unchanged-screen publisher did not complete: cookie {cookie:#x}'
         identity=wire.ready_identity(response,connection_id=1,info=info)
-        body=bytearray()
-        while len(body)<identity.total_length:
-            if interleave:interleave()
-            piece=request(0x59,identity.token,len(body),info.max_response)
-            assert wire.ready_identity(piece,connection_id=1,info=info)==identity,'frozen descriptor changed'
-            body.extend(piece.payload)
+        body=read_frozen_body(request,identity,info,interleave)
         wire.validate_snapshot(bytes(body),identity=identity,info=info)
         assert request(0x59,identity.token,len(body),32).payload==b''
         # Duplicate reads are byte-identical; the client may retry after timeout.
@@ -453,6 +523,75 @@ def run(image, modules, model, hs, out):
             last_body,again=snapshot(0x22340000+retry)
         assert last_body[:1280]==first[:1280],'no static LCD interval in eight attempts'
         print(f'  [PASS] {tag}: fresh static-LCD lease, generations {identity.generation}/{again.generation} (LED refresh may advance generation)',flush=True)
+        # Feed the real stock RX-ring producer, which raises parser INT37.
+        # The accepted-input detours, calibration, serializer and EP0 lease
+        # all execute in this selected image; no observer helper is called.
+        def input_report(opcode,value):
+            b.call(0x40092254,opcode)
+            b.call(0x40092254,value)
+        fader_route=mki_fader_registration(b,sym['pm_test_scratch']) if model=='mki' else dict(method='stock calibrated UART1 parser')
+        def fader_position(stock):
+            if model=='mki':
+                received=127-stock if fader_route['factory_inverted'] else stock
+                b.call(fader_route['registered_callback'],received)
+            else:
+                input_report(0x40,min(255,stock*2))
+        baseline=wire.validate_snapshot(last_body,identity=again,info=info).inputs
+        assert baseline is not None and baseline.known & 5 == 5,'input baseline was not seeded'
+        frozen_body,frozen_identity=snapshot(0x12340006,release=False)
+        # Borrowed RX calls can advance more than the one-second lease in
+        # emulated time. Accept only the contract's two precise outcomes:
+        # a still-live immutable body or a canonical expired lease.
+        fader_position(64)
+        after_input=request(0x59,frozen_identity.token,0,info.max_response)
+        require_input_epoch(after_input.header,frozen_identity)
+        if after_input.header.status==wire.Status.OK:
+            assert wire.ready_identity(after_input,connection_id=1,info=info)==frozen_identity
+            reread=read_frozen_body(request,frozen_identity,info)
+            assert reread==frozen_body,'accepted input mutated the immutable READY body'
+            assert request(0x5a,frozen_identity.token).header.status==wire.Status.OK
+            lease_input_outcome='immutable body reread after accepted input'
+        else:
+            assert after_input.header.status==wire.Status.STALE,'after-report lease was neither READY nor expired'
+            header=after_input.header
+            assert not any((header.generation,header.token,header.total_length,header.offset,
+                            header.payload_length,header.crc32)) and not after_input.payload,'expired lease leaked a descriptor'
+            lease_input_outcome='STALE: lease expired during borrowed parser calls'
+        input_report(0x27,0)
+        input_report(0x27,1)
+        input_report(0x27,1)  # duplicate held report is no new edge
+        input_report(0x27,0)  # short tap retained between acquisitions
+        input_report(0x30,3)
+        input_report(0x30,254)  # -2
+        input_report(0x36,128)  # -128, extend before negating
+        fader_position(64)  # final stock position 64 -> browser 63
+        input_body,input_identity=snapshot(0x12340007)
+        require_input_epoch(input_identity,frozen_identity)
+        observed=wire.validate_snapshot(input_body,identity=input_identity,info=info).inputs
+        assert observed.known==7 and observed.fader==63,'calibrated fader input mismatch'
+        assert observed.keys[7]==0,'released encoder push remained held'
+        assert (observed.press_counts[56]-baseline.press_counts[56])%65536==1,'short push/duplicate edge mismatch'
+        assert tuple((v-u)%65536 for v,u in zip(observed.encoder_counts[0],baseline.encoder_counts[0]))==(3,2),'opposite detents lost'
+        assert tuple((v-u)%65536 for v,u in zip(observed.encoder_counts[6],baseline.encoder_counts[6]))==(0,128),'-128 LEVEL detents lost'
+        for stock,position,cookie in ((0,127,0x12340008),(127,0,0x12340009)):
+            fader_position(stock)
+            fader_body,fader_identity=snapshot(cookie)
+            require_input_epoch(fader_identity,frozen_identity)
+            assert wire.validate_snapshot(fader_body,identity=fader_identity,info=info).inputs.fader==position,'fader endpoint orientation mismatch'
+        if model=='mki':
+            # Also execute the real alternate factory callback, without
+            # changing the registered pointer or pretending to measure ADC.
+            alternate=0x40092fac if fader_route['factory_inverted'] else 0x40092f88
+            for received in (0,64,127):
+                b.call(alternate,received)
+                alternate_body,alternate_identity=snapshot(0x12340100+received)
+                require_input_epoch(alternate_identity,frozen_identity)
+                alternate_inputs=wire.validate_snapshot(alternate_body,identity=alternate_identity,info=info).inputs
+                position=received if alternate==0x40092f88 else 127-received
+                assert alternate_inputs.known==7 and alternate_inputs.fader==position,'alternate stock fader callback orientation mismatch'
+                assert alternate_inputs.press_counts==observed.press_counts and alternate_inputs.encoder_counts==observed.encoder_counts,'fader callback manufactured button/encoder edges'
+            fader_route['alternate_callback']=alternate
+        print(f'  [PASS] {tag}: real stock-parser short push and signed/opposite detents; fader midpoint/endpoints via {fader_route}; {lease_input_outcome}',flush=True)
         # A delayed, primed reply is superseded by a new SETUP. Borrowed stock
         # getter forces the guest through the first SETUP before the second.
         b.setup(0xc0,0x57,0,0,64);b.call(0x40010b00)
@@ -521,7 +660,7 @@ def run(image, modules, model, hs, out):
                 pump.check()
                 if mirror_phase and not midi_during_mirror:
                     usb_host.midi_send(b,bytes.fromhex('904163f8'))
-                    assert b'\x09'+midi in b.ep_in(2,512)
+                    require_midi_note(b,midi)
                     midi_during_mirror=True
                 if mirror_phase and not controls_done:
                     expected_stalls+=uac2_during_lease(b,request,0x12340004)
@@ -582,7 +721,7 @@ def run(image, modules, model, hs, out):
         usb_host.midi_send(b,bytes.fromhex('903c64b03c40'))
         midi=bytes.fromhex('903c64');b.poke(sym['pm_test_scratch'],midi)
         b.call(0x40010bc8,len(midi),sym['pm_test_scratch'])
-        assert b'\x09'+midi in b.ep_in(2,512)
+        midi_evidence=require_midi_note(b,midi)
         # Reset in the middle of a read retires the old epoch/token.
         pending=request(0x58,77)
         b.setup(0xc0,0x59,pending.header.token,0,64);b.call(0x40010b00)
@@ -604,6 +743,7 @@ def run(image, modules, model, hs, out):
     raw_uart=uart.read_bytes()
     oracle=PanelLink();oracle.feed(raw_uart)
     shadow=lambda name:(dump/(name+'.bin')).read_bytes()
+    if model=='mki':assert int.from_bytes(shadow('fixture_uart2_callback'),'big')==fader_route['registered_callback'],'UART2 registration changed during the gate'
     if audio:check_audio_fixture(shadow('fixture_selectors'),shadow('fixture_delay'))
     assert shadow('pm_lcd')==bytes(oracle.frame),'live shadow LCD disagrees with independent UART'
     for family,reference in (('row',oracle.led_rows),('level',oracle.leds)):
@@ -612,9 +752,10 @@ def run(image, modules, model, hs, out):
     # Boot-ring bytes before RTOS attachment precede this UART instrument.
     # Anchor the generation offset with the final separately-checked shadow,
     # then compare the frozen body at its own exact complete-message boundary.
-    final_generation=int.from_bytes(shadow('pm_generation'),'big')
-    at_snapshot=uart_at_generation(raw_uart,final_generation,last_identity.generation)
-    frozen=PanelLink();frozen.feed(last_body)
+    final_generation=int.from_bytes(shadow('pm_output_generation'),'big')
+    frozen_output_generation=int.from_bytes(shadow('pm_body_output_generation'),'big')
+    at_snapshot=uart_at_generation(raw_uart,final_generation,frozen_output_generation)
+    frozen=PanelLink();frozen.feed(last_body[:-wire.INPUT_RECORD_SIZE])
     assert frozen.frame==at_snapshot.frame,'snapshot LCD disagrees with UART at its generation'
     assert frozen.led_rows==at_snapshot.led_rows,'snapshot LED rows disagree with UART'
     assert frozen.leds==at_snapshot.leds,'snapshot LED levels disagree with UART'
@@ -622,8 +763,8 @@ def run(image, modules, model, hs, out):
     txt=log.read_text();matches=re.findall(r'(\d+) stall\(s\)',txt)
     assert matches and int(matches[-1])==expected_stalls,(matches,expected_stalls)
     assert 'hold ended on the client' in txt,'bench expired instead of completing'
-    print(f'  [PASS] {tag}: protocol1.0, complete UART-equal LCD/LED snapshot; expected STALLs={expected_stalls}',flush=True)
-    return dict(model=model,speed='hs' if hs else 'fs',uart_bytes=len(uart.read_bytes()),body_bytes=len(last_body),descriptors=descriptions,expected_stalls=expected_stalls,audio=audio_evidence if audio else [])
+    print(f'  [PASS] {tag}: protocol1.1, complete UART-equal LCD/LED snapshot and accepted input suffix; expected STALLs={expected_stalls}',flush=True)
+    return dict(model=model,speed='hs' if hs else 'fs',uart_bytes=len(uart.read_bytes()),body_bytes=len(last_body),descriptors=descriptions,expected_stalls=expected_stalls,input_lease=lease_input_outcome,fader_route=fader_route,midi_note=midi_evidence,audio=audio_evidence if audio else [])
 
 
 def matrix_selections():

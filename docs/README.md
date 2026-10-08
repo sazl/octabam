@@ -60,3 +60,9 @@ and [OTX_MODULE_GUIDELINES.md](proposals/OTX_MODULE_GUIDELINES.md).
 [../CHANGELOG.md](../CHANGELOG.md) has one entry per image that reached a
 unit. Records that were closed and removed are cited in place as
 `git show <sha>:<path>`.
+
+## USB panel input development
+
+[Input mirroring design](superpowers/specs/2026-10-08-usb-panel-input-design.md)
+and [implementation plan](superpowers/plans/2026-10-08-usb-panel-input.md)
+record the schema-2 physical control extension and its verification scope.

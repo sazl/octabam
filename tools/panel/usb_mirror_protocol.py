@@ -11,6 +11,11 @@ from pathlib import Path
 import struct
 import zlib
 
+if __package__:
+    from .panel_backend import InputSnapshot
+else:
+    from panel_backend import InputSnapshot
+
 _DEFINITION_PATH = Path(__file__).resolve().parents[2] / 'modules/usb-panel-mirror/protocol.json'
 DEFINITION = json.loads(_DEFINITION_PATH.read_text())
 globals().update(DEFINITION['constants'])
@@ -94,6 +99,8 @@ class BodySummary:
     led_rows: tuple[int, ...]
     led_ids: tuple[int, ...]
     backlight_known: bool
+    output_length: int
+    inputs: InputSnapshot | None
 
 
 def validate_definition(definition) -> None:
@@ -205,13 +212,15 @@ def parse_response(raw: bytes, *, request: SetupRequest, max_response: int = 64)
     if len(raw)<HEADER_SIZE: raise ProtocolError('truncated header')
     values=struct.unpack(HEADER_STRUCT,raw[:HEADER_SIZE])
     if values[0]!=MAGIC: raise IncompatibleProtocol('wrong mirror magic')
-    if values[1:3]!=(PROTOCOL_MAJOR,PROTOCOL_MINOR):
+    if values[1]!=PROTOCOL_MAJOR or not 0<=values[2]<=PROTOCOL_MINOR:
         raise IncompatibleProtocol('unsupported protocol version')
     try: h=Header(*values[1:3],Status(values[3]),Operation(values[4]),*values[5:])
     except ValueError: raise ProtocolError('unknown status or response kind') from None
     if h.kind!=op: raise ProtocolError('request/response kind mismatch')
     if not h.epoch: raise ProtocolError('zero session epoch')
     _flags(h.flags)
+    if h.flags & INPUT_SUPPORTED and h.minor < 1:
+        raise ProtocolError('input capability requires protocol minor 1')
     if len(raw)!=HEADER_SIZE+h.payload_length or len(raw)>request.length or len(raw)>max_response:
         raise ProtocolError('actual response length mismatch')
     descriptor=(h.total_length,h.offset,h.payload_length,h.crc32)
@@ -247,9 +256,11 @@ def parse_info(response: Response) -> Info:
         raise ProtocolError('INFO OK metadata required')
     values=struct.unpack(INFO_STRUCT,response.payload)
     schema,model,width,height,pages,columns,ceiling,maximum,poll,valid,lease,rate,n,build=values
-    if (schema,width,height,pages,columns)!=(BODY_SCHEMA,LCD_WIDTH,LCD_HEIGHT,LCD_PAGES,LCD_BLOCK_COLUMNS):
+    if schema not in (1,2) or (width,height,pages,columns)!=(LCD_WIDTH,LCD_HEIGHT,LCD_PAGES,LCD_BLOCK_COLUMNS):
         raise IncompatibleProtocol('unsupported body schema or geometry')
-    if ceiling not in SUPPORTED_RESPONSE_SIZES or not LCD_WIRE_BYTES<=maximum<=MAX_SCHEMA_BODY_SIZE:
+    _schema_capabilities(schema,h.flags & CAPABILITY_MASK)
+    minimum,limit=_body_bounds(schema)
+    if ceiling not in SUPPORTED_RESPONSE_SIZES or not minimum<=maximum<=limit:
         raise IncompatibleProtocol('unsupported response/body bound')
     if not poll or not lease or not rate or valid>LCD_BLOCK_COUNT:
         raise ProtocolError('invalid INFO limits')
@@ -268,7 +279,8 @@ def ready_identity(response: Response, *, connection_id: int, info: Info) -> Sna
     if h.flags & CAPABILITY_MASK != info.capabilities: raise ProtocolError('capabilities changed within epoch')
     if h.flags & (LCD_COMPLETE|OBSERVER_ACTIVE)!=(LCD_COMPLETE|OBSERVER_ACTIVE):
         raise ProtocolError('snapshot not ready')
-    if not LCD_WIRE_BYTES<=h.total_length<=min(info.max_snapshot,MAX_SCHEMA_BODY_SIZE) or h.total_length%2:
+    minimum,maximum=_body_bounds(info.schema)
+    if not minimum<=h.total_length<=min(info.max_snapshot,maximum) or h.total_length%2:
         raise ProtocolError('body length outside negotiated bound')
     return SnapshotIdentity(connection_id,h.epoch,h.token,h.generation,h.total_length,h.crc32,h.flags)
 
@@ -277,9 +289,41 @@ def crc32(body: bytes) -> int:
     return zlib.crc32(body) & 0xffffffff
 
 
+def _schema_capabilities(schema,capabilities):
+    if schema not in (1,2):
+        raise IncompatibleProtocol('unsupported body schema')
+    if bool(capabilities & INPUT_SUPPORTED)!=(schema==2):
+        raise ProtocolError('input capability/schema mismatch')
+
+
+def _body_bounds(schema):
+    if schema==1: return LCD_WIRE_BYTES,MAX_SCHEMA1_BODY_SIZE
+    if schema==2: return LCD_WIRE_BYTES+INPUT_RECORD_SIZE,MAX_SCHEMA_BODY_SIZE
+    raise IncompatibleProtocol('unsupported body schema')
+
+
+def _parse_inputs(record):
+    if len(record)!=INPUT_RECORD_SIZE or record[:2]!=bytes((INPUT_MARKER,INPUT_VERSION)):
+        raise ProtocolError('invalid input record marker/version/length')
+    known,fader=record[INPUT_OFFSET_KNOWN:INPUT_OFFSET_KEYS]
+    if known & ~INPUT_KNOWN_FLAGS or fader>127:
+        raise ProtocolError('invalid input flags/fader')
+    keys=tuple(record[INPUT_OFFSET_KEYS:INPUT_OFFSET_PRESS_COUNTS])
+    presses=struct.unpack('>64H',record[INPUT_OFFSET_PRESS_COUNTS:INPUT_OFFSET_ENCODER_COUNTS])
+    detents=struct.unpack('>14H',record[INPUT_OFFSET_ENCODER_COUNTS:])
+    if ((not known & INPUT_KEYS_KNOWN and (any(keys) or any(presses))) or
+            (not known & INPUT_FADER_KNOWN and fader) or
+            (not known & INPUT_ENCODERS_KNOWN and any(detents))):
+        raise ProtocolError('nonzero unknown input family')
+    return InputSnapshot(known,fader if known & INPUT_FADER_KNOWN else None,
+                         keys,presses,tuple(zip(detents[::2],detents[1::2])))
+
+
 def validate_snapshot(body: bytes, *, identity: SnapshotIdentity, info: Info) -> BodySummary:
     body=bytes(body)
-    if len(body)!=identity.total_length or len(body)%2 or not LCD_WIRE_BYTES<=len(body)<=min(info.max_snapshot,MAX_SCHEMA_BODY_SIZE):
+    _schema_capabilities(info.schema,info.capabilities)
+    minimum,maximum=_body_bounds(info.schema)
+    if len(body)!=identity.total_length or len(body)%2 or not minimum<=len(body)<=min(info.max_snapshot,maximum):
         raise ProtocolError('snapshot body length invalid')
     _flags(identity.frozen_flags)
     if identity.frozen_flags & CAPABILITY_MASK != info.capabilities:
@@ -287,6 +331,10 @@ def validate_snapshot(body: bytes, *, identity: SnapshotIdentity, info: Info) ->
     if identity.frozen_flags & (LCD_COMPLETE|OBSERVER_ACTIVE)!=(LCD_COMPLETE|OBSERVER_ACTIVE):
         raise ProtocolError('snapshot lacks ready state')
     if crc32(body)!=identity.crc32: raise ProtocolError('snapshot CRC mismatch')
+    inputs=None
+    if info.schema==2:
+        inputs=_parse_inputs(body[-INPUT_RECORD_SIZE:])
+        body=body[:-INPUT_RECORD_SIZE]
     pos=0
     for page in range(LCD_PAGES):
         for col in range(0,LCD_WIDTH,LCD_BLOCK_COLUMNS):
@@ -313,13 +361,15 @@ def validate_snapshot(body: bytes, *, identity: SnapshotIdentity, info: Info) ->
                                  (backlight,BACKLIGHT_KNOWN,BACKLIGHT_SUPPORTED)):
         if present!=bool(identity.frozen_flags & known) or (present and not identity.frozen_flags & support):
             raise ProtocolError('optional state/flags mismatch')
-    return BodySummary(LCD_BLOCK_COUNT,tuple(rows),tuple(ids),backlight)
+    return BodySummary(LCD_BLOCK_COUNT,tuple(rows),tuple(ids),backlight,len(body),inputs)
 
 
 class SnapshotAssembler:
     """Bounded exact coverage; completion is certified only by finish()."""
     def __init__(self, identity: SnapshotIdentity, info: Info):
-        if not LCD_WIRE_BYTES<=identity.total_length<=min(info.max_snapshot,MAX_SCHEMA_BODY_SIZE) or identity.total_length%2:
+        _schema_capabilities(info.schema,info.capabilities)
+        minimum,maximum=_body_bounds(info.schema)
+        if not minimum<=identity.total_length<=min(info.max_snapshot,maximum) or identity.total_length%2:
             raise ProtocolError('snapshot bound invalid before allocation')
         self.identity=identity; self.info=info
         self._body=bytearray(identity.total_length); self._coverage=bytearray(identity.total_length)
