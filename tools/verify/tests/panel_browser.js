@@ -36,6 +36,16 @@ async function evaluate(expression, socket = ws) {
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 function assert(value, message) { if (!value) throw new Error(message); }
+async function waitRequests(predicate, message, full = false) {
+  const deadline=Date.now()+3000;
+  let requests;
+  do {
+    requests=await (await fetch(`${base}/requests${full ? '?full=1' : ''}`,{signal:AbortSignal.timeout(1000)})).json();
+    if (predicate(requests)) return requests;
+    await pause(20);
+  } while (Date.now()<deadline);
+  throw new Error(message+'; observed requests: '+JSON.stringify(requests));
+}
 async function waitPanelReady(socket = ws, previousOrigin = null) {
   const deadline=Date.now()+10000;
   let last;
@@ -450,14 +460,13 @@ try {
   await fixture('legacy');
   assert((await evaluate("document.querySelector('#source').textContent")) === 'EMULATOR', 'historical backend=port without source remains interactive');
   await evaluate(`document.querySelector('.knob.live').dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaY:-100})); setFader(11);`);
-  await pause(120);
-  requests = await (await fetch(`${base}/requests`)).json();
+  requests = await waitRequests(requests=>requests.includes('/knob'), 'emulator wheel must send encoder turn');
   assert(requests.includes('/knob'), 'emulator wheel must send encoder turn');
-  const full = await (await fetch(`${base}/requests?full=1`)).json();
+  const full = await waitRequests(requests=>requests.includes('/xfader?pos=11'), 'emulator fader timer must send its requested position', true);
   assert(full.includes('/xfader?pos=11'), 'emulator fader timer must send its requested position');
 
   await evaluate(`document.querySelector('.k[data-id="yes"]').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));document.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); document.dispatchEvent(new KeyboardEvent('keydown',{key:'Shift',bubbles:true}));`);
-  await pause(100);
+  await waitRequests(requests=>requests.includes('/key') && requests.includes('/xfader'), 'emulator key event and periodic fader must remain interactive');
   requests = await (await fetch(`${base}/requests?clear=1`)).json();
   assert(requests.includes('/key') && requests.includes('/xfader'), 'emulator key event and periodic fader must remain interactive');
   await evaluate(`document.querySelector('.knob.live').dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaY:-100})); setFader(10);`);
