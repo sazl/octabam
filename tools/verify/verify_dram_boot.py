@@ -8,8 +8,9 @@ For the current REMIX (the image at out/mainos_bus.bin):
   * the octabam window (out/platform/runtime/runtime.bin, when the remix
     has DRAM units) reads back equal to the linked runtime -- except for
     bytes the runtime itself writes once it runs
-    (midi-scenes' state words are the known case), which are counted and
-    printed, not hidden.
+    (midi-scenes retains the legacy 16-byte policy). Mirror images permit
+    only explicitly named initialized capture objects, report their extents
+    and mutation counts, and reject any change elsewhere.
 
 SKIPs when the port is not built (`make emu-cf`) or the remix carries no
 DRAM payload. What this cannot see: caches (the port has none), the
@@ -22,6 +23,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401  (every tools/ dir on sys.path)
+from port_image import launch_args  # noqa: E402
+from dram_boot_state import compare_runtime  # noqa: E402
 from remix import platform_build, registry  # noqa: E402
 
 EMU = ROOT / "out/emu/ot_emu"
@@ -64,7 +67,7 @@ if dram:
 args = [str(EMU), "--image", str(IMAGE), "--max", "80000000",
         "--watch-pc", f"0x{entry:x},0x{fatal:x}",
         "--mem-dump", ";".join(f"0x{a:x},{n}={p}" for a, n, p in dumps)]
-r = subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
+r = subprocess.run(launch_args(args), capture_output=True, text=True, cwd=ROOT)
 out = r.stdout
 handoff = "HANDOFF" in out
 hits = [l for l in out.splitlines() if l.strip().startswith("[") and " at 0x" in l]
@@ -73,12 +76,31 @@ fatal_hits = sum(1 for l in hits if f"at 0x{fatal:x}" in l)
 ok = handoff and entry_hits == 1 and fatal_hits == 0
 print(f"  [{'PASS' if ok else 'FAIL'}] verify_dram_boot: {remix.name} boots to the handoff; "
       f"loader ran {entry_hits}x, its fatal hang {fatal_hits}x")
+runtime_symbols = {}
+if "USB PANEL MIRROR" in remix.modules:
+    nm = subprocess.run(["m68k-elf-nm", str(ROOT / "out/platform/runtime/runtime.elf")],
+                        capture_output=True, text=True, check=True).stdout
+    runtime_symbols = {f[2]: (int(f[0], 16), f[1])
+                       for f in (line.split() for line in nm.splitlines()) if len(f) == 3}
 for (a, n, p), (label, raw) in zip(dumps, expects):
     got = p.read_bytes() if p.exists() else b""
-    diff = [i for i in range(min(len(got), len(raw))) if got[i] != raw[i]]
-    fine = len(got) == len(raw) and len(diff) <= 16
+    try:
+        comparison = compare_runtime(raw, got, base=a, module_keys=remix.modules, symbols=runtime_symbols)
+    except ValueError as error:
+        print(f"  [FAIL] verify_dram_boot: {error}")
+        ok = False
+        continue
+    diff, fine = comparison.differences, comparison.ok
     ok &= fine
     print(f"  [{'PASS' if fine else 'FAIL'}] verify_dram_boot: {label} at 0x{a:08x} == linked "
           f"runtime ({n:,} B) except {len(diff)} byte(s) the runtime wrote itself"
           + (f" at +{diff[0]:#x}.." if diff else ""))
+    for name, address, size, changed in comparison.permitted:
+        print(f"    permitted {name}: 0x{address:08x}..0x{address + size:08x} "
+              f"({size} B), {changed} byte(s) changed")
+    if comparison.permitted and comparison.unexpected:
+        print(f"  [FAIL] verify_dram_boot: {len(comparison.unexpected)} undeclared runtime "
+              f"change(s), first at +{comparison.unexpected[0]:#x}")
+    if len(got) != len(raw):
+        print(f"  [FAIL] verify_dram_boot: runtime dump length {len(got)} != expected {len(raw)}")
 sys.exit(0 if ok else 1)

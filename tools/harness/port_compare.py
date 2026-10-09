@@ -18,6 +18,7 @@ the two are fitted per track -- lag, least-squares scale, residual -- and
 the port's TX0 main slot against `mix.wav` (LEVEL^2 and the sum)."""
 import argparse, json, math, os, pathlib, shutil, subprocess, sys, wave
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401
+from port_image import launch_args  # noqa: E402
 import blockdump as bd                      # noqa: E402
 import recloop as rl                        # noqa: E402  (track_audio, readback_audio)
 
@@ -129,6 +130,7 @@ def main():
                "--set", a.set_name, "--project", a.name, "--sequencer", "--internal-clock",
                "--frames", str(a.frames), "--load-ms", str(a.load_ms), "--dsp", "--main-level", str(a.main_level),
                "--audio-in", a.tone, "--audio-out", str(out / "port"), "--block-dump", str(dump)]
+        cmd = launch_args(cmd)
         print("port: " + " ".join(cmd[1:]))
         with open(out / "port.txt", "w") as log:
             subprocess.run(cmd, check=True, stdout=log, stderr=subprocess.STDOUT)

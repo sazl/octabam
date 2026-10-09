@@ -343,6 +343,9 @@ audio_getiface_shim:
     .global audio_reset_shim
 audio_reset_shim:
     jsr     0x4001d6b8              | displaced
+.ifdef USB_PANEL_MIRROR
+    bsr pm_transport_reset
+.endif
     bsr     audio_alt0_request
     moveq   #64,%d0                 | displaced: USBSTS.URI, written back at 0x4001e922
     jmp     0x4001e922
@@ -352,6 +355,9 @@ audio_reset_shim:
 | clears USBCMD.RS.
     .global audio_sessend_shim
 audio_sessend_shim:
+.ifdef USB_PANEL_MIRROR
+    bsr pm_transport_reset
+.endif
     bsr     audio_alt0_request
     movel   0xfc0b0140,%d0          | displaced
     jmp     0x4001e958
@@ -1437,6 +1443,13 @@ audio_cushion_zero:
 | straight out of memory.
     .global audio_ctrl_shim
 audio_ctrl_shim:
+.ifdef USB_PANEL_MIRROR
+    bsr pm_ctrl
+    tstl %d0
+    beqs 9f
+    jmp SETIFACE_DONE
+9:
+.endif
     mvzb    SETUP_BMREQ,%d0
     | A vendor GET (bmRequestType 0xc0, bRequest 0x55) reads the
     | fifteen counters below back over EP0 as 60 big-endian bytes, so a

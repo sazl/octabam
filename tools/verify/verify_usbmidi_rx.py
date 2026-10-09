@@ -32,6 +32,7 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401
+from port_image import launch_args  # noqa: E402
 import usb_host  # noqa: E402  (tools/harness)
 
 from remix import registry  # noqa: E402
@@ -75,8 +76,8 @@ def main():
     sock = f"/tmp/ot-usbrx-{os.getpid()}.sock"
     log = ROOT / "out/verify_usbmidi_rx.log"
     with open(log, "w") as lf:
-        emu = subprocess.Popen([str(EMU), "--image", str(IMAGE), "--usb-host", sock, "--usb-hold-ms", "180000",
-                                "--watch-mem", f"{MSG_BUF:#x},{sum(len(r) for _, r in cases) + 64}"],
+        emu = subprocess.Popen(launch_args([str(EMU), "--image", str(IMAGE), "--usb-host", sock, "--usb-hold-ms", "180000",
+                                "--watch-mem", f"{MSG_BUF:#x},{sum(len(r) for _, r in cases) + 64}"]),
                                cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT)
     fails = []
 

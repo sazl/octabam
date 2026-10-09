@@ -16,6 +16,7 @@ docs/firmware/PANEL.md), so the window's PROJ/PART/AED/ARR/REC3 keys work;
 import argparse, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])); import toolpath  # noqa: E402,F401
+from port_image import launch_args  # noqa: E402
 import ot_project as otp  # noqa: E402
 import verify_set as vs  # noqa: E402
 
@@ -78,7 +79,7 @@ def main():
         cmd.append("--mkii")
     print("emu-live: booting (the screen appears once the project has loaded; ~30 s)")
     with open(log, "w") as lf:
-        port = subprocess.Popen(cmd, cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT)
+        port = subprocess.Popen(launch_args(cmd), cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT)
         keep = os.open(fifo, os.O_RDWR)              # holds the FIFO open for the port
         while port.poll() is None and "live       : reading panel" not in log.read_text():
             time.sleep(0.2)

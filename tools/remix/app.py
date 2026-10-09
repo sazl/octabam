@@ -638,7 +638,7 @@ class RemixerScreen(Screen):
     def avail_rows(self):
         """Everything that COULD be in an image: our modules by category
         (schema.Category, the module table's grouping), then stock."""
-        mods = [m for m in registry.modules().values() if not m.is_stock]
+        mods = [m for m in registry.modules().values() if not m.is_stock and m.key != registry.PANEL_ADAPTER]
         mods.sort(key=lambda m: (self._GROUPS.index(m.category or Category.REFERENCE),
                                  disp(m).lower()))
         return mods + list(stock.MODULES)

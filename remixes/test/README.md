@@ -51,6 +51,8 @@ Each carries one module, or one combination, for that module's gates: `make chec
 | [`usb-out-master`](usb-out-master/README.md) | stock + USB MIDI + USB AUDIO OUT MASTER (2 ch: track 8). | port-gated |
 | [`usb-out-tracks`](usb-out-tracks/README.md) | stock + USB MIDI + USB AUDIO OUT TRACKS (16 ch: the tracks). | port-gated |
 | [`usb-out-tracks-main-cue`](usb-out-tracks-main-cue/README.md) | stock + USB MIDI + USB AUDIO (20 ch: tracks, MAIN, CUE). | port-gated |
+| [`usb-panel-main`](usb-panel-main/README.md) | USB panel mirror, USB MIDI and MAIN output test carrier. | `make check`: Experimental; see local verification evidence. |
+| [`usb-panel-standalone`](usb-panel-standalone/README.md) | USB panel mirror and USB MIDI standalone test carrier, without audio. | `make check`: Experimental; see local verification evidence. |
 | [`vocoder`](vocoder/README.md) | VOCODER beside the stock effects (all but PLATE REV, whose words it takes, and DJ EQ, so its table sits in X). | on hardware: Ignorato's MKII, OCTABAM12 (the earlier positions T1 T2 T5 T6), 4 Oct 2026; the current positions not flashed on this build |
 | [`waveload`](waveload/README.md) | CF METER + WAVE LOAD on stock: T8's FX2 BURN = K 4-voice wave engines per frame interrupt, read over USB. | on hardware: image 92, Sam's MKII, 3 Oct 2026 |
 | [`waveload-port`](waveload-port/README.md) | waveload without the idle loop: the port gate for the wave engines in the frame interrupt. | port-gated: the load path under the port |

@@ -127,6 +127,8 @@ def _overlap(a_start, a_len, b_start, b_len) -> bool:
 
 def check(selected) -> list[str]:
     """Return a list of collisions among these modules. Empty means clean."""
+    from remix.registry import resolve_selected
+    selected = resolve_selected(selected)
     problems: list[str] = []
 
     def clash(what, owner_a, owner_b, detail):

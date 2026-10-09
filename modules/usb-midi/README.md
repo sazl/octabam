@@ -5,6 +5,13 @@ mirroring the DIN ports. markandrus's work ([octemu](https://github.com/markandr
 `custom/usb-midi.py` + `custom/coldfire/usb-midi.s` at `6a9ff68`, MIT),
 carried onto octabam's DRAM platform.
 
+The optional [USB PANEL MIRROR](../usb-panel-mirror/README.md) requires USB MIDI
+and one audio dispatcher or its exclusive standalone adapter. Its vendor IN
+requests `0x57`–`0x5a` are separate from audio/input counters `0x55`/`0x56`.
+The [mirror evidence record](../../docs/firmware/USB_PANEL_MIRROR.md) keeps its
+port checks and remaining physical driver/audio requirements separate from the
+USB MIDI measurements below.
+
 ## Measured
 
 Under the ColdFire port (25 Sep 2026), `make check REMIX=usb`, `verify_usb`:

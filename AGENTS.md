@@ -817,3 +817,18 @@ green) rather than as a fix for an observed symptom. Not octemu's other
 DE-renewal hunk (disabling `HostTransmitData` as a request source):
 `ot_emu` drives HDI08 directly, never through a `DmaChannel`, so that
 half doesn't apply here (checked, not inferred).
+
+## USB panel mirror invariants
+
+Mirror vendor IN requests occupy `0x57`-`0x5a`; preserve existing `0x55`/`0x56`
+and descriptor identity. Accepted panel output begins **before** the DRAM loader:
+never detour early ring commits directly into unloaded DRAM. Use the initialized
+ROM guard/FIFO and fail closed on overflow or a bypassed wire path. The publisher
+copies and computes CRC outside USB/audio IRQs; EP0 must never wait for a full
+snapshot. State must be explicitly initialized, and DMA replies must be private,
+aligned and uncached. A replacement SETUP is not a DMA-completion guarantee;
+flush and check EP0 IN before reusing its reply. The 10 Hz limit bounds successful
+publications, not raced copy attempts or CPU cost. Port instruction counts do
+not prove microseconds. Host access must not configure/reset/claim/detach the audio
+interfaces. [USB_PANEL_MIRROR.md](docs/firmware/USB_PANEL_MIRROR.md) records the ABI,
+corrected boot boundary and the limits of port proof.

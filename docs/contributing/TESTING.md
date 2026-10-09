@@ -584,3 +584,87 @@ code.
 [CONTRIBUTING.md "Before you open a PR"](../../CONTRIBUTING.md#before-you-open-a-pr)
 is the list. Flashing your own unit is a separate step:
 [BUILDING.md section 5](../guide/BUILDING.md#5-flash-from-the-card).
+
+## 14. USB mirror and panel source coverage
+
+```sh
+make test-panel                        # stdlib protocol/transport/backend/route discovery, venv when present
+make test-acceptance                   # all firmware-free Python suites, including panel tests
+make test-panel-pyusb                  # requires PyUSB 1.3.1; tests real-library safe disposal without hardware
+make verify-usb-panel REMIX=<carrier> BUILD=<matching image build>
+make reach TESTS=1                     # include the otherwise excluded test carriers
+make reach TESTS=1 FULL=1              # explicit full graph; default stays quick
+```
+
+`test-panel` discovers actual `test_usb_panel_*.py` and `test_panel_*.py` suites.
+Protocol checks cover endian/layout/CRC, allocation and malformed bounded bodies;
+transport checks forbid configuration, reset, interface claims, driver detach,
+endpoint use and unsafe borrowed-context disposal. Backend checks cover atomic
+views, static-screen heartbeat, disconnect, cancellation and bounded resources.
+Server checks cover source arguments, asset-free hardware startup, route reads,
+all known refused operations (including GET mutations/uploads), status and
+multiple viewers. These synthetic suites require no private firmware/project or
+physical device. The dedicated PyUSB CI job installs only PyUSB 1.3.1 and runs
+one Make target; ordinary public acceptance CI remains dependency-light. Actions
+remain SHA-pinned. The existing `ci-emu` job includes generic park/resume and raw
+UART instrument tests without proprietary images.
+
+The owning module declares `verify_usb_panel.py` as an image-stage gate, so it
+runs against the restored selected image after ordinary set/USB checks. The
+focused `verify-usb-panel` target checks that existing final image; it does not
+build a replacement image or substitute a different carrier. Exact REMIX/BUILD
+propagation and the generic image shard job are covered by runner tests. A
+feature-promising carrier with absent symbols/handshake must fail. A missing
+port/image/applicable fixture or `[SKIP]` means blocked strict acceptance;
+timeout, nonzero exit or `[FAIL]` means failure even if a child exits zero. The
+existing strict runner is unchanged.
+
+Reach resolves script-local and package imports through panel tools and routes
+actual test dependencies to `test-acceptance`. Executed protocol-definition paths
+are dependencies; comments alone are not. Declared module gates and shared USB
+source dependencies retain carrier routing. Browser/native-only changes reach
+panel contract tests and docs; a real-browser run remains a separate local check.
+Test carriers stay excluded by default; `TESTS=1` includes them. Quick reach does
+not stand for the explicit carrier/model/speed matrix, which must run separately.
+
+Final-image assembly proof must include accepted UART equality, boot/live
+initialization, late attach, interrupted publication, lease expiry/reset,
+CRC/chunk faults, DMA/replacement-setup/abort, preserved descriptors/requests and
+existing audio/MIDI/input/alignment gates across standalone and supported audio
+selections. Deliberately bypass capture or dispatch to demonstrate that the
+instrument fails. Fresh post-INFO-fix candidate `8c8ff16d` passed all 80 registry matrix
+runs (20 output/input selections × MKI/MKII × HS/FS), four standalone runs and
+three private capture/dispatch/publisher negative controls. These runs establish
+modeled digital behavior, not a physical integration. The 240 audio windows
+retain raw counters: FS short-build counts 0–446 use source/cadence/conservation
+bounds; 30 HS input selections show underrun deltas 0–2 and only claim input
+progress/bad-partial checks. All 84 normal cases also assert current INFO generation
+before/after complete updates and acquisition of the resulting snapshot. Later
+browser lifecycle/retry edits leave this firmware and verifier unchanged. DSP
+destination routing is the separate gate below.
+See the final PR's reached-gate record for combined-root results and their exact
+commit; earlier host-suite and matrix totals describe their own checkpoints.
+
+Independent existing gates cover 20 output selections through an image-validated
+private park wrapper, 15 native input selections and five input-absent N/A cases
+at the reviewed core checkpoint. MKI output checks use HS/FS; active DSP/recorder
+input checks use HS only. The reviewed permanent launch helper subsequently
+passed canonical unwrapped output and input gates on the same MAIN+ABCD image
+and runtime ELF. Keep these coverage distinctions: the existing output tag
+oracle ignores unrecognized words, and none of these passes establish all-sample
+purity, concurrent snapshot/input traffic or MAIN/CUE alignment. `OT_PROJECT`
+is absent here; `verify_usb_align` honestly reports SKIP, which blocks strict
+release acceptance. Supply an authorized source project and rerun that gate
+before claiming project alignment.
+
+The [design record](../firmware/USB_PANEL_MIRROR.md) distinguishes the initial
+port boot/EP0 results from hardware budgets. The [operator guide](../guide/USB_PANEL_MIRROR.md)
+records safe permissions and recovery. No physical unit, driver trace, sustained
+audio workload, measured latency/headroom or flash is available in this record.
+Chromium 151/Linux browser acceptance used a fake HTTP source and covered two tabs
+and legacy controls under Node 24. Encoded EP0 E2E uses the real SnapshotClient,
+HardwareBackend and HTTP handler; separate production server smoke boots stock
+and the MAIN mirror image, checks the borrowed main call's live gain result and
+exercises AMP attack keys/knob, with no project and sound off. Native
+AppKit runtime remains unmeasured. Never download
+private OS/project fixtures or upload firmware-bearing `out/` artifacts in CI.

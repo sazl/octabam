@@ -1,5 +1,15 @@
 # The panel: surface, fonts, text and regions (OS 1.40C, MKII)
 
+The experimental [USB panel mirror](USB_PANEL_MIRROR.md) observes accepted
+outgoing panel bytes rather than a guessed framebuffer. Its boot capture found
+traffic before the DRAM loader: an initialized ROM FIFO guards both accepted
+ring commits, then drains in order after the loader before live observation.
+The FIFO holds 3072 bytes; both models accepted 2522 early bytes. Separate
+MKI/MKII captured runtime UART vectors are byte-identical with capture enabled
+or disabled (6919/8156 bytes), with full 128-block LCD coverage;
+this does not establish physical timing or audio coexistence. The historical
+measurements below remain their original evidence.
+
 Read out of `out/raw/section_3_MAIN_OS.bin` (SHA256 `164f3122…`), base
 `0x40000400`, on 16 Sep 2026, while chasing why the arranger greys a field
 out. This is the part of `MAINMENU.md` section 8's "drawing primitives behind the

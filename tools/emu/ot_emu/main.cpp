@@ -1234,6 +1234,8 @@ int main(int _argc, char** _argv)
 	double ataLatency = -1.0;	// --ata-latency: samples between an ATA data sector and its interrupt (default: the Rtos's 8, ~180 us)
 	std::string setName = "OCTABAM", projectName = "ONEAUX";
 	std::string serialOut;
+	std::string panelTx;
+	uint32_t mainPark = 0, mainResume = 0;
 	double runMs = 1000.0;
 	double ips = 3990.0;
 	bool frame = false;			// the DSP frame clock; off by default, as in route A
@@ -1324,6 +1326,25 @@ int main(int _argc, char** _argv)
 		else if(a == "--ata-latency" && i + 1 < _argc)	ataLatency = std::atof(_argv[++i]);
 		else if(a == "--set" && i + 1 < _argc)		setName = _argv[++i];
 		else if(a == "--project" && i + 1 < _argc)	projectName = _argv[++i];
+		else if(a == "--main-park" && i + 1 < _argc)
+		{
+			const std::string value = _argv[++i];
+			const auto colon = value.find(':');
+			uint64_t park = 0, resume = 0;
+			if(mainPark || colon == std::string::npos
+				|| !parseNumber(value.substr(0, colon), park)
+				|| !parseNumber(value.substr(colon + 1), resume)
+				|| !park || !resume || park > UINT32_MAX || resume > UINT32_MAX
+				|| (park & 1) || (resume & 1)
+				|| ot::Machine::alias(static_cast<uint32_t>(park)) == ot::Machine::alias(static_cast<uint32_t>(resume)))
+			{
+				std::fprintf(stderr, "--main-park requires one PARK:RESUME pair of distinct positive even 32-bit addresses (decimal or 0x hex)\n");
+				return false;
+			}
+			mainPark = static_cast<uint32_t>(park);
+			mainResume = static_cast<uint32_t>(resume);
+		}
+		else if(a == "--panel-tx" && i + 1 < _argc) panelTx = _argv[++i];
 		else if(a == "--serial-out" && i + 1 < _argc)	serialOut = _argv[++i];
 		else if(a == "--ms" && i + 1 < _argc)	runMs = std::atof(_argv[++i]);
 		else if(a == "--ips" && i + 1 < _argc)	ips = std::atof(_argv[++i]);
@@ -1402,6 +1423,8 @@ int main(int _argc, char** _argv)
 		{
 			std::printf("usage: ot_emu [--image FILE] [--max N] [--periph] [--profile]\n"
 			"              [--golden FILE] [--ms N] [--boot-logo]\n"
+			"              [--main-park PARK:RESUME]                         explicit emulator-only background-service park/continuation PCs\n"
+			"              [--panel-tx FILE]                                 raw panel UART transmit bytes at normal batch/USB-hold exit\n"
 			"              [--usb-host SOCKET] [--usb-notify FILE] [--usb-fs]   the USB device controller + a scripted host (usb.h)\n"
 			"              [--interactive] [--rtc host|off|EPOCH] [--dsp-rt]    the line protocol on stdin/stdout (tools/panel)\n"
 			"              [--step FRAME:call|poke|dump:SPEC]...              a gate's whole script on one boot: FRAME '-' = after the load, N = N frames after the transport start\n"
@@ -1776,7 +1799,14 @@ int main(int _argc, char** _argv)
 			if(!usbNotify.empty())
 				rtos.setUsbNotify(usbNotify);
 		}
+		if(mainPark && !rtos.setMainPark(mainPark, mainResume))
+		{
+			std::fprintf(stderr, "--main-park: %s\n", rtos.why().c_str());
+			return 2;
+		}
 		rtos.install();
+		if(mainPark)
+			std::printf("rtos       : explicit main park %#x, resume %#x (emulator instrument)\n", mainPark, mainResume);
 		if(const auto r = rtos.spinRange(); r.second)
 			std::printf("rtos       : main's park is detoured to %#x (a jmp at %#x): PCs in [%#x, %#x) count as the park; a borrowed call returns to the stock bras\n",
 				r.first, ot::g_mainSpin - 6, r.first, r.second);
@@ -2793,6 +2823,19 @@ int main(int _argc, char** _argv)
 					w.sample, w.addr, w.val, w.size, w.pc, ot::taskName(w.tcb), static_cast<unsigned long long>(w.instr));
 		}
 
+		if(!panelTx.empty())
+		{
+			const auto& tx = rtos.serialTxA();
+			std::ofstream f(panelTx, std::ios::binary);
+			f.write(reinterpret_cast<const char*>(tx.data()), static_cast<std::streamsize>(tx.size()));
+			f.close();
+			if(!f)
+			{
+				std::fprintf(stderr, "panel tx   : cannot write %s\n", panelTx.c_str());
+				return 1;
+			}
+			std::printf("panel tx   : %zu raw byte(s) on UART A -> %s\n", tx.size(), panelTx.c_str());
+		}
 		if(!serialOut.empty())
 		{
 			for(const auto& [suffix, tx] : {std::make_pair("a", &rtos.serialTxA()),
