@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Volume mixer gate: execute linked ColdFire meter code in the stock UI task.
+"""Volume mixer gate: execute the composed DRAM runtime in the stock UI task.
 
 Arithmetic/source cases require no project or DSP. Key/panel/timing cases run
 the real stock UI with a disposable saved project. Playing DSP audio remains
 a separate integration gate; generated firmware and captures stay under out/.
+Without --case all cases boot the composed image; focused cases inject linked
+source fixtures for debugging. Missing saved-project prerequisites are errors.
 """
 from __future__ import annotations
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 import struct
+import subprocess
 import sys
 
 from volume_mixer_probe import (ROOT, STOCK, SCRATCH, assemble, boot_port, call,
@@ -19,6 +24,40 @@ from volume_mixer_probe import (ROOT, STOCK, SCRATCH, assemble, boot_port, call,
 METER = ROOT / 'modules/volume-mixer/meter.s'
 BASE = SCRATCH + 0x8000
 BUFFER = SCRATCH + 0xe000
+
+
+def test_registration(remix='volume-mixer'):
+    """The ledger must reject a real claimed span and allow TUNER's sites."""
+    from remix import registry, ledger
+    from remix.schema import Detour, Gate, Kind, Module
+    module = registry.modules().get('VOLUME MIXER')
+    assert module is not None, 'VOLUME MIXER is missing from the module registry'
+    assert module.kind is Kind.CF_PATCH and module.menu is None and module.dsp is None
+    assert [u.source for u in module.linked] == ['modules/volume-mixer/meter.s',
+                                               'modules/volume-mixer/panel.s']
+    assert all(u.dram for u in module.linked)
+    assert Gate('tools/verify/verify_volume_mixer.py', venv=True) in module.gates
+    targets = {'frame': 'vm_frame', 'mixer': 'vm_mixer', 'midi': 'vm_midi',
+               'ui': 'vm_tick', 'recorder_router': 'vm_rec_router'}
+    assert len(module.detours) == len(targets)
+    for name, (site, expected, _) in PINS.items():
+        detour = next(d for d in module.detours if d.site == site)
+        assert detour.expect.hex() == expected and detour.symbol == targets[name]
+        assert detour.kind == ('jsr' if name == 'recorder_router' else 'jmp')
+        assert detour.pad_to == (8 if name == 'midi' else None)
+        other = Module('occupied-vm-site', 'OCCUPIED VM SITE', Kind.CF_PATCH,
+                       'test occupant', detours=(Detour(site, bytes.fromhex(expected),
+                                                       target=0, pad_to=detour.pad_to),))
+        failures = ledger.check([module, other])
+        assert failures and any('volume-mixer' in f and 'occupied-vm-site' in f
+                                for f in failures), failures
+    assert not ledger.check([module, registry.by_key('TUNER')])
+    selected = registry.selected(registry.remix(remix))
+    assert module in selected and not ledger.check(selected)
+    fixture = registry.remix('volume-mixer')
+    assert fixture.modules == ('VOLUME MIXER',) and fixture.fallback == 'NONE'
+    print('PASS volume mixer registry, asserted spans, named collision refusals and TUNER compatibility', flush=True)
+
 WRAPPERS = r'''
 .text
 .globl _start
@@ -222,7 +261,8 @@ def test_frame_hook(p, s):
     """Exercise the real ISR detour; catch stack/live-register/replay damage."""
     addr, expected, continuation = PINS['frame']
     original = peek(p, addr, 6)
-    assert original.hex() == expected
+    assert original == (b'\x4e\xf9' + struct.pack('>I', s['vm_frame'])
+                        if s.get('_composed') else bytes.fromhex(expected))
     reset(p, s)
     poke(p, addr, b'\x4e\xf9' + struct.pack('>I', s['vm_frame']))
     try:
@@ -294,13 +334,19 @@ def instruction_costs(p, s):
     return result
 
 
-def run_meter_cases(model, case, out):
-    report = {'model': model, 'case': case, 'passed': False, 'tests': []}
+def run_meter_cases(model, case, out, composed=None):
+    report = {'model': model, 'case': case, 'composed': bool(composed), 'passed': False, 'tests': []}
     try:
-        with boot_port(model, STOCK, out) as p:
+        with boot_port(model, composed[0] if composed else STOCK, out) as p:
             p.proc.command('frame off', 'ok')
-            install_mailbox(p)
-            s = load_meter(p)
+            if composed:
+                s = load_composed(p, composed)
+                # Arithmetic fixtures use vm_window=1 rather than a stock handle.
+                # Keep real UI drawing out of those fixtures; UI cases retain it.
+                ui_hook(p, s, False)
+            else:
+                install_mailbox(p)
+                s = load_meter(p)
             tests = ([test_signed_peaks, test_clip_hold, test_snapshot_reset]
                      if case == 'arithmetic' else [test_channel_sources, test_closed_no_work, test_frame_hook])
             for test in tests:
@@ -330,15 +376,7 @@ probe_refresh:
 
 def load_panel(p):
     assert PANEL.is_file(), 'live ColdFire panel implementation is missing'
-    # Independent test seam at the proved UI queue head. The production UI
-    # detour remains installed at c92 and executes on every real task tick.
-    source = MAILBOX_SOURCE.replace('tstl 0x46104ca8\n jmp 0x40056c98',
-                                   'pea 0x460d1664\n jmp 0x40056c78')
-    blob, syms = assemble(source, p.out / 'mailbox')
-    poke(p, SCRATCH, blob)
-    assert peek(p, 0x40056c72, 6).hex() == '4879460d1664'
-    poke(p, 0x40056c72, b'\x4e\xf9' + struct.pack('>I', SCRATCH))
-    p.mailbox = syms
+    install_ui_mailbox(p)
     blob, s = assemble(METER.read_text() + PANEL.read_text() + WRAPPERS + PANEL_WRAPPERS,
                        p.out / 'panel', BASE)
     assert len(blob) < BUFFER - BASE
@@ -351,6 +389,80 @@ def load_panel(p):
         patch = opcode + struct.pack('>I', s[symbol])
         patch += b'\x4e\x71' * ((len(bytes.fromhex(expected)) - 6) // 2)
         poke(p, addr, patch)
+    run(p, 100)
+    return s
+
+
+def install_ui_mailbox(p, symbols=None):
+    # Independent test seam at the proved UI queue head. The production UI
+    # detour remains installed at c92 and executes on every real task tick.
+    source = MAILBOX_SOURCE.replace('tstl 0x46104ca8\n jmp 0x40056c98',
+                                   'pea 0x460d1664\n jmp 0x40056c78')
+    original = peek(p, 0x40056c72, 6)
+    chain = None
+    if original.hex() != '4879460d1664':
+        from remix import registry
+        detour = next(d for d in registry.by_key('TUNER').detours if d.site == 0x40056c72)
+        assert symbols and detour.symbol in symbols, 'unrecognized UI queue-head replacement'
+        chain = symbols[detour.symbol]
+        assert original == b'\x4e\xf9' + struct.pack('>I', chain), 'UI queue head is not the composed TUNER detour'
+        # Preserve TUNER's own replay/register/flag contract after the mailbox.
+        source = source.replace('pea 0x460d1664\n jmp 0x40056c78', f'jmp 0x{chain:x}')
+    blob, syms = assemble(source, p.out / 'mailbox')
+    poke(p, SCRATCH, blob)
+    poke(p, 0x40056c72, b'\x4e\xf9' + struct.pack('>I', SCRATCH))
+    p.mailbox = syms
+    if chain is not None:
+        assert b'\x4e\xf9' + struct.pack('>I', chain) in blob, 'mailbox failed to encode the exact TUNER chain'
+        watch(p, [chain, 0x40056c78])
+        run(p, 100)
+        records = hits(p)
+        assert records and len(records) % 2 == 0
+        for entry, end in zip(records[::2], records[1::2]):
+            assert entry[1] == chain and end[1] == 0x40056c78, 'TUNER did not execute/continue through the test chain'
+            assert entry[2:6] == end[2:6] and entry[12:] == end[12:], 'TUNER test chain changed live registers'
+            assert entry[6] - 4 == end[6] and end[7] == 0x460d1664, 'TUNER did not replay the queue-head PEA'
+        p.proc.command('watch off', 'ok')
+        print('PASS test-only mailbox chains the actual composed TUNER UI hook', flush=True)
+
+
+def build_composed(remix, out):
+    """Use the normal composer/loader; never inject replacement module code."""
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / 'build.log').open('w') as log:
+        subprocess.run(['make', 'bus', f'REMIX={remix}'], cwd=ROOT,
+                       stdout=log, stderr=subprocess.STDOUT, check=True)
+    image = out / 'mainos.bin'
+    shutil.copy2(ROOT / 'out/mainos_bus.bin', image)
+    elf = ROOT / 'out/platform/runtime/runtime.elf'
+    nm = subprocess.check_output(['m68k-elf-nm', str(elf)], text=True)
+    symbols = {parts[2]: int(parts[0], 16) for line in nm.splitlines()
+               if len(parts := line.split()) == 3}
+    blob = (ROOT / 'out/platform/runtime/runtime.bin').read_bytes()
+    layout = json.loads((ROOT / 'out/platform/layout.json').read_text())
+    return image, symbols, blob, layout['base']
+
+
+def load_composed(p, composed):
+    from remix import registry
+    _, symbols, runtime, base = composed
+    s = dict(symbols)
+    # Compare boot-depacked executable bytes against the actual linked image.
+    for start, end in ((s['vm_frame'], s['vm_window']), (s['vm_mixer'], s['VM_LAYER'])):
+        assert peek(p, start, end - start) == runtime[start - base:end - base], 'booted DRAM runtime differs from the composed executable'
+    for d in registry.by_key('VOLUME MIXER').detours:
+        expected = (b'\x4e\xb9' if d.kind == 'jsr' else b'\x4e\xf9') + struct.pack('>I', s[d.symbol])
+        expected += b'\x4e\x71' * (((d.pad_to or 6) - 6) // 2)
+        assert peek(p, d.site, len(expected)) == expected, f'composed detour {d.symbol} missing'
+    install_ui_mailbox(p, s)
+    definitions = '\n'.join(f'.set {name},0x{value:x}' for name, value in s.items()
+                            if name.startswith(('vm_', 'VM_')))
+    source = (WRAPPERS + PANEL_WRAPPERS).replace('bsr.w vm_', 'jsr vm_').replace('bra.w vm_', 'jmp vm_')
+    blob, wrappers = assemble(definitions + '\n' + source, p.out / 'wrappers', BASE)
+    assert len(blob) < BUFFER - BASE
+    poke(p, BASE, blob)
+    s.update(wrappers)
+    s['_composed'] = True
     run(p, 100)
     return s
 
@@ -666,13 +778,13 @@ def test_refresh_wrap(p, s):
     call(p, s['vm_close'])
 
 
-def run_panel_cases(model, case, out, project):
+def run_panel_cases(model, case, out, project, composed=None):
     assert project and project.is_dir(), 'key/UI gate requires a disposable saved project'
-    report = {'model':model, 'case':case, 'passed':False, 'tests':[]}
+    report = {'model':model, 'case':case, 'composed':bool(composed), 'passed':False, 'tests':[]}
     try:
-        with boot_port(model, STOCK, out, project=project) as p:
+        with boot_port(model, composed[0] if composed else STOCK, out, project=project) as p:
             p.proc.command('frame off', 'ok')
-            s = load_panel(p)
+            s = load_composed(p, composed) if composed else load_panel(p)
             tests = {'keys':[test_chords_both_models, test_release_after_close, test_navigation,
                              test_eviction, test_stock_forwarding, test_recorder_deferral],
                      'panels':[test_pixels], 'timing':[test_refresh_wrap]}[case]
@@ -694,17 +806,30 @@ def run_panel_cases(model, case, out, project):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('remix', nargs='?', default='volume-mixer')
-    parser.add_argument('--case', choices=('arithmetic', 'sources', 'keys', 'panels', 'timing'), required=True,
-                        help='focused runtime gates; full module integration follows registration')
+    parser.add_argument('--case', choices=('registration', 'arithmetic', 'sources', 'keys', 'panels', 'timing'),
+                        help='focused injected-code gate; omitted runs every case on the composed image')
     parser.add_argument('--model', choices=('mki', 'mkii', 'both'), default='both')
     parser.add_argument('--out', type=Path, default=ROOT / 'out/volume-mixer/verify')
-    parser.add_argument('--project', type=Path, default=ROOT / 'out/volume-mixer/source-project')
+    parser.add_argument('--project', type=Path, default=Path(os.environ.get('OT_PROJECT', ROOT / 'out/volume-mixer/source-project')))
     args = parser.parse_args()
+    if args.case == 'registration':
+        test_registration(args.remix)
+        return
+    cases = (args.case,) if args.case else ('arithmetic', 'sources', 'keys', 'panels', 'timing')
+    if any(case in ('keys', 'panels', 'timing') for case in cases) and not args.project.is_dir():
+        parser.error('key/UI gate requires an existing saved project: --project or OT_PROJECT')
+    composed = None
+    if args.case is None:
+        test_registration(args.remix)
+        composed = build_composed(args.remix, args.out / 'composed')
     for model in ('mki', 'mkii') if args.model == 'both' else (args.model,):
-        report = (run_meter_cases(model, args.case, args.out / model / args.case)
-                  if args.case in ('arithmetic', 'sources') else
-                  run_panel_cases(model, args.case, args.out / model / args.case, args.project))
-        print(f'{model}: PASS {args.case}', flush=True)
+        for case in cases:
+            report = (run_meter_cases(model, case, args.out / model / case, composed)
+                      if case in ('arithmetic', 'sources') else
+                      run_panel_cases(model, case, args.out / model / case, args.project, composed))
+            print(f'{model}: PASS {case}', flush=True)
+    if composed:
+        print('PASS composed volume mixer runtime; playing-DSP audio/timing and hardware remain future gates', flush=True)
 
 if __name__ == '__main__':
     main()
