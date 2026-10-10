@@ -9,7 +9,7 @@ import struct
 import subprocess
 import wave
 
-from volume_mixer_probe import ROOT, PINS
+from volume_mixer_probe import ROOT, PINS, STOCK
 import emu_card
 import ot_project
 
@@ -84,6 +84,54 @@ def timeline(active):
     return '\n'.join(f'{ms} {event}' for ms, event in sorted(events)) + '\n'
 
 
+def transport_handlers(model):
+    """Read each model's stock key table; zero means no release callback."""
+    stock = STOCK.read_bytes()
+    table = 0x400c01f4 if model == 'mkii' else 0x400bfc10
+    handlers = {}
+    for i in range(64):
+        offset = table - 0x40000400 + 26*i
+        record = stock[offset:offset+26]
+        if record[0] == 0xff: break
+        if record[0] in (CODES['PLAY'], CODES['STOP']):
+            handlers[record[0]] = struct.unpack('>2I', record[2:10])
+    assert set(handlers) == {CODES['PLAY'], CODES['STOP']}
+    return handlers
+
+
+def validate_transport(log, active, symbols, handlers):
+    """Merge PC and memory observations by native instruction count."""
+    expected = [(name, edge, address) for name in ('PLAY','STOP','PLAY','STOP')
+                for edge,address in zip(('down','up'), handlers[CODES[name]]) if address]
+    addresses = {address for _,_,address in expected}
+    events = []
+    for hit in re.finditer(r'\[\s*(\d+)\] at (0x[0-9a-f]+) d0=.*?\[sp \S+: \S+ (0x[0-9a-f]+|0) (0x[0-9a-f]+|0) ', log):
+        instruction, pc = int(hit[1]), int(hit[2],16)
+        if pc == PINS['frame'][2]: events.append((instruction, 'block', 0, None))
+        if pc in addresses: events.append((instruction, 'handler', pc, (int(hit[3],0), int(hit[4],0))))
+    for hit in re.finditer(r'\[\s*([0-9.]+)\] \[(0x[0-9a-f]+)\] <- (0x[0-9a-f]+|0) \(4\).*? i=(\d+)', log):
+        sample, address, value, instruction = float(hit[1]), int(hit[2],16), int(hit[3],0), int(hit[4])
+        if address in (symbols['vm_window'], 0x800065b8):
+            events.append((instruction, 'window' if address == symbols['vm_window'] else 'state', value, sample))
+    window, blocks, observed, states = 0, 0, [], []
+    for instruction, kind, value, sample in sorted(events):
+        if kind == 'block': blocks += 1
+        elif kind == 'window': window = value
+        elif kind == 'handler': observed.append({'pc':value, 'visible':bool(window), 'key_code':sample[0], 'pressed':sample[1], 'audio_block':blocks})
+        elif value or states: states.append({'value':value, 'visible':bool(window), 'sample':sample, 'audio_block':blocks})
+    assert blocks > 19000, ('missing completed DSP block observations', blocks)
+    assert [event['pc'] for event in observed] == [a for _,_,a in expected], ('transport handlers missing or reordered', observed, expected)
+    visibility = [False] + [active]*(len(expected)-1)
+    assert [event['visible'] for event in observed] == visibility, ('transport handler visibility', observed)
+    assert [(event['key_code'], event['pressed']) for event in observed] == [(CODES[name], int(edge == 'down')) for name,edge,_ in expected], ('transport press/release arguments', observed)
+    # This stock STOP path writes stopped/end state 0 twice; retain both
+    # raw writes but assert the changes of state (1 means running).
+    transitions = [event for i,event in enumerate(states) if not i or event['value'] != states[i-1]['value']]
+    assert [event['value'] for event in transitions] == [1,0,1,0], ('sequencer did not PLAY/STOP twice', states)
+    assert [event['visible'] for event in transitions] == [False,active,active,active], ('transport state visibility', states)
+    for event,(name,edge,_) in zip(observed,expected): event.update(key=name, edge=edge)
+    return {'handlers':observed, 'states':states, 'transitions':transitions, 'completed_blocks':blocks}
+
 def capture(model, image, out, card, wav, active, symbols):
     out.mkdir(parents=True, exist_ok=True)
     script = out / 'keys.txt'; script.write_text(timeline(active))
@@ -107,8 +155,12 @@ def capture(model, image, out, card, wav, active, symbols):
                for name,(site,expected,_) in PINS.items()]
     argv += ['--mem-dump', ';'.join(f'{a:#x},{n}={out/name}' for a,n,name in ranges)]
     if model == 'mkii': argv += ['--mkii']
-    argv += ['--watch-pc', ','.join(hex(symbols[n]) for n in ('vm_open','vm_draw')),
-             '--watch-mem', f'{symbols["vm_page"]:#x},4']
+    handlers = transport_handlers(model)
+    (out/'transport-handlers.json').write_text(json.dumps(handlers)+'\n')
+    watches = [symbols[n] for n in ('vm_open','vm_draw')] + [PINS['frame'][2]]
+    watches += sorted({a for pair in handlers.values() for a in pair if a})
+    argv += ['--watch-pc', ','.join(hex(a) for a in watches),
+             '--watch-mem', f'{symbols["vm_page"]:#x},4;{symbols["vm_window"]:#x},4;0x800065b8,4']
     (out/'command.json').write_text(json.dumps(argv, indent=2)+'\n')
     with (out/'port.log').open('w') as log:
         subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=900)
@@ -120,6 +172,8 @@ def validate_capture(out, card, active, symbols):
     log = (out/'port.log').read_text()
     assert 'ended on quit' in log and 'DID NOT RETURN' not in log, log[-3000:]
     assert int.from_bytes((out/'gain.bin').read_bytes(),'big'), 'native main gain was not initialized'
+    handlers = {int(k):v for k,v in json.loads((out/'transport-handlers.json').read_text()).items()}
+    transport = validate_transport(log, active, symbols, handlers)
     controls = []
     ui = {'open_pages':[], 'page_transitions':[], 'draws':0}
     for i in range(len(CONTROLS)):
@@ -177,7 +231,7 @@ def validate_capture(out, card, active, symbols):
     for path, data in project_files.items():
         assert persisted.get(path) == data, f'persisted project file changed: {path}'
     return selected, {'samples':len(selected)//12, 'controls':controls, 'ui':ui,
-                     'pcm24_sha256':hashlib.sha256(selected).hexdigest(), 'project_files':len(project_files)}
+                     'transport':transport, 'pcm24_sha256':hashlib.sha256(selected).hexdigest(), 'project_files':len(project_files)}
 
 
 def run_audio_cases(model, out, project, composed):
@@ -193,6 +247,13 @@ def run_audio_cases(model, out, project, composed):
         assert len(ref) == len(actual), 'stock/module frame counts differ'
         assert ref == actual, f'MAIN/CUE differ at byte {next(i for i,(a,b) in enumerate(zip(ref,actual)) if a!=b)}'
         assert report['stock_handlers']['controls'] == report['module']['controls']
+        # Count actual stock frame continuations, not scheduler sample/16:
+        # UI dispatch follows ISR return, so these blocks are completed.
+        # Wrappers may cost instructions within the same delivered block.
+        assert [e['audio_block'] for e in report['stock_handlers']['transport']['handlers']] == [e['audio_block'] for e in report['module']['transport']['handlers']], 'transport callback block changed'
+        reference_states = report['stock_handlers']['transport']['states']
+        actual_states = report['module']['transport']['states']
+        assert [(e['value'],e['audio_block']) for e in reference_states] == [(e['value'],e['audio_block']) for e in actual_states], 'actual transport timeline changed'
         report['passed'] = True
     finally:
         (out/'report.json').write_text(json.dumps(report,indent=2)+'\n')

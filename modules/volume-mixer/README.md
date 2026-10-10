@@ -120,7 +120,10 @@ This controls the DSP input phase: separately booting raw stock and the
 remix produced an unrelated eight-sample offset. No output shift or
 correlation is allowed by the passing gate. It compares every packed
 24-bit MAIN/CUE sample over closed view, all pages, navigation, repeated
-close/reopen and PLAY/STOP while visible. Live LEVEL, paired input gains,
+close/reopen and PLAY/STOP while visible. Model-specific stock key-table
+callbacks must receive the exact transport press/release arguments; window
+and sequencer-state writes establish which transitions occur while visible.
+Live LEVEL, paired input gains,
 MAIN/CUE values and persisted project files must remain identical.
 
 The real-input gate feeds one isolated positive and negative rail to each
