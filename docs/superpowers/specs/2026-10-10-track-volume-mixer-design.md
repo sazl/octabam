@@ -137,3 +137,89 @@ Before a PR, rebase onto origin/main and run the CONTRIBUTING.md reach gates
 on that rebased tree. No OS bytes or screenshots containing stock firmware
 assets are committed. Hardware validation on both models remains necessary
 before declaring the feature hardware-proven.
+
+## Measured stock contracts (10 October 2026)
+
+`tools/verify/volume_mixer_probe.py --model both` boots the branch-built
+ColdFire port on the user's stock image, injects panel events and reads the
+firmware's UART LCD stream. Both models have the following contracts:
+
+| Hook | Asserted bytes | Continuation and replay |
+| --- | --- | --- |
+| MIXER | `0x4007d468`: `4ab9460e7424` | `0x4007d46e`, `tst.l 0x460e7424`; preserve its flags for the stock branch |
+| MIDI | `0x40055678`: `2f032f02262f000c` | `0x40055680`, push d3, push d2, load code from sp+12 |
+| UI | `0x40056c92`: `4ab946104ca8` | `0x40056c98`, `tst.l 0x46104ca8`; preserve registers, recreate the tested flags |
+| Frame | `0x4000d98e`: `203980004800` | `0x4000d994`, `move.l 0x80004800,d0` after sampling |
+| REC1 recorder call | `0x40030ffc`: `4eb940097924` | `0x40031002`, stock call `0x40097924`; continuation discards five stack arguments |
+
+The module registry has no detour overlapping these spans. TUNER's frame
+hook at `0x4000d99a` and UI hook at `0x40056c72`, USB's `0x4000d9a0`,
+CF METER's `0x4000d9a6`, and STEM REC's `0x40004b12` stay distinct.
+Consequently the selected hooks do not require a TUNER conflict.
+
+At the frame site, the remaining instructions only advance the modulo-four
+counter before TUNER/USB's established sites. They do not write any audio
+source or either source selector. A temporary probe copies the selected
+track, input and MAIN/CUE blocks plus their selectors at both `0x4000d98e`
+and `0x4000d9a0`, comparing 386 words on every frame. Both models report
+zero differences. The counter advances by one modulo four between sites.
+The ISR restores d0–d7/a0–a6 from its original stack at `0x4000d9a6`;
+the stub must restore its own stack depth and replay the load into d0.
+The following `addq`, `moveq`, `and` establish the counter and flags, so
+entry CCR is dead. EMAC state has already been restored: do not use EMAC.
+This proves local source equivalence to the existing taps, not playing
+DSP audio or hardware timing. Those remain separate module gates.
+
+The UI site runs 60 times in one idle second on both models. It is after
+queue receive and the stock UI callbacks. Preserve d2–d7/a2–a6, which
+carry loop constants, and preserve d0/d1/a0/a1 as well to avoid depending
+on unproved downstream liveness. Replay the `tst` last. The investigated
+`0x4007e760` manages a linked list and rebuilds eight indexed 14-byte UI
+records; it is not an established arbitrary periodic callback API, so
+this design uses the measured UI site. To average 25 draws per second on
+this 60 Hz task, advance an absolute deadline by 40 ms and skip missed
+periods. Resetting the deadline to `now + 40 ms` after every draw would
+produce 20 Hz. This scheduling ruling replaces the plan's reset-to-now
+wording; timer-wrap and missed-period behavior still need runtime tests.
+
+MKI's key table is `0x400bfc10`; MKII's is `0x400c01f4`. Both dispatch
+MIXER press to `0x4007d468`, MIDI press/release to `0x40055678`, REC1
+press/release to `0x40030e6c`, and CUE press/release to
+`0x4004e978`/`0x4004e968`. MIDI's handler receives `(0x35, edge)` with
+edge 1 on press and 0 on release. Ordinary audio-mode MIDI presses do
+not change `0x80000012`; release toggles it. Consumed MIDI releases must
+therefore be suppressed even when the custom window has already closed.
+CUE's held long is `0x460d168c`; ordinary REC1's held long is
+`0x460d10d0`. Raw held rows are at `0x46100b18` and remain the reliable
+chord source. A cached release handler survives pushing a new layer.
+FUNC+MIDI and FUNC+MIXER open their stock views without changing MIDI mode.
+Both release orders, standalone taps, and the stock mixer open/close path
+are covered by captured state and LCD traces.
+
+**REC1 requires deferral.** A copied saved project with mode byte 2 follows
+the ordinary held-key path. With its current track's mode byte temporarily
+set to 4 in emulator RAM, REC1 press reaches `0x40097924` and the recording
+command routine `0x400977cc` *before MIXER is pressed*, on both models.
+Clearing held state afterward cannot undo that command. At `0x40030ffc`
+the five stack arguments are `(track, recorder_mode, key, edge, arg)`;
+REC1 key is `0x2b`. Intercept this narrow call, retain recording-producing
+press arguments, and cancel both recording edges when MIXER consumes the
+chord. For an unconsumed release, call the saved press using a separate
+argument copy, then call the current release. The stock router rewrites
+its argument stack in its tail call, so the saved arguments must not
+share the pending release's stack. Preserve the ordinary held-key/UI path.
+The implementation ruling's user-visible cost is that standalone REC1 in
+this recording mode starts recording on release. No early flush on other keys is proved
+or required. Production tests must check this adverse mode as well as the
+saved project's original mode.
+
+A full display needs `WCREATE(128, 64, -1, 0, 5, closed_callback)`:
+the stock constructor adds one to its x origin, so an x argument of zero
+would clip the last column. The drawing surface is `window + 36`, not
+the window handle itself. Stock BOX drawing produces exactly four 3×3
+corner squares (36 lit pixels), including all four physical LCD corners,
+on both models. Opening stock TEMPO evicts class 5, calls the custom
+callback exactly once and removes the custom input layer. NO explicitly
+closes the custom window while CUE is still held; CUE's own sublayer
+remains until its cached release clears held state and removes it.
+All screenshots and raw disassembly stay under `out/volume-mixer/`.
