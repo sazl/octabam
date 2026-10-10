@@ -11,8 +11,9 @@ Tracks show separate L/R activity **post-FX, pre-LEVEL** alongside each
 track's existing LEVEL. Inputs A–D show raw input activity; A/B display
 their common stock gain, and C/D theirs. MAIN/CUE show separate L/R final
 digital output feeds beside existing main/cue volume. Every scale is 0–127
-with a fixed horizontal 100 reference. The stage names follow existing
-USB/STEM evidence; playing-DSP equivalence remains a separate gate.
+with a fixed horizontal 100 reference. The input tap is the stock ColdFire input arena, after the stock input
+gate. An ADC rail attenuated by that gate does not reach this meter as a
+rail. These are digital signal stages, not measurements of analog headroom.
 
 The producer scans every sample of every 16-frame block. Input labels
 invert and gain `!` after either signed digital rail, held for 1379 blocks
@@ -69,8 +70,9 @@ untouched; no Elektron firmware or font bytes are stored in the repo.
 
 ## Port measurements and gates
 
-Proof is `PORT`: arithmetic, key lifecycle, firmware LCD pixels and idle
-refresh are tested under both model modes. No hardware proof is claimed.
+Proof is `PORT`: arithmetic, key lifecycle, firmware LCD pixels, refresh
+and playing DSP audio are tested under both model modes. No hardware
+proof is claimed.
 Observed instruction counts are identical on MKI/MKII; they are emulator
 instructions, **not chip cycles, hardware timing or WCET**:
 
@@ -96,18 +98,40 @@ OT_PROJECT=<saved-project-copy> .venv/bin/python3 tools/verify/verify_volume_mix
 ```
 
 The registered default gate runs every arithmetic/source/key/panel/timing
-case on both models against the **actual composed runtime**, verifies its
+and playing-DSP case on both models against the **actual composed runtime**, verifies its
 boot-depacked executable bytes and installed detours, then calls its
 symbols through test-only wrappers. Only the call mailbox/wrappers are
 injected. If TUNER occupies the mailbox's UI queue-head site, the test
 mailbox chains its validated composed target; PC/register/stack traces
 prove TUNER still executes and replays the queue-head instruction.
-Focused `--case` runs preserve standalone source-linked fixtures
-for local debugging. UI cases require a saved project (`--project`,
+Focused arithmetic/UI `--case` runs preserve standalone source-linked
+fixtures for local debugging; audio/input cases always use the composed
+image. UI and audio cases require a saved project (`--project`,
 `OT_PROJECT`, or ignored `out/volume-mixer/source-project`); missing data
 is an error. Every boot uses a disposable card copy. Generated firmware,
 disassembly and LCD captures stay under ignored `out/volume-mixer/`.
 
-Playing DSP audio invariance and refresh during playback are the next
-integration gate. Idle port success does not establish either those
-properties or physical MKI/MKII behavior.
+The audio fixture derives THRU machines with FX NONE in both slots from
+the supplied saved project. Seeded four-channel 24-bit input produces
+nonzero, independent stereo output. The reference and test share the
+composed DSP/loader boot; the reference then restores all five exact
+stock hook spans, verified by readback, before the frame engine starts.
+This controls the DSP input phase: separately booting raw stock and the
+remix produced an unrelated eight-sample offset. No output shift or
+correlation is allowed by the passing gate. It compares every packed
+24-bit MAIN/CUE sample over closed view, all pages, navigation, repeated
+close/reopen and PLAY/STOP while visible. Live LEVEL, paired input gains,
+MAIN/CUE values and persisted project files must remain identical.
+
+The real-input gate feeds one isolated positive and negative rail to each
+of A–D over a sub-rail carrier that keeps the stock input gate open. With
+silence before a rail, stock gating attenuates it at this tap (the supplied
+project's GATE 127 gave `0x5511f9` from `0x7fffff`; GATE 0 gave `0x04c827`).
+Every pulse must reload only its own hold to 1379 blocks, reach a display
+snapshot between refreshes, then age and expire without another rail.
+Playing refresh is checked against completed frame time.
+
+These are deterministic lockstep port results. They do not prove
+startup equivalence to an unmodified stock image, physical ADC overload
+detection, chip timing, asynchronous hardware races or uninterrupted
+UI/audio on a physical MKI/MKII.

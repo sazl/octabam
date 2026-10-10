@@ -2,9 +2,9 @@
 """Volume mixer gate: execute the composed DRAM runtime in the stock UI task.
 
 Arithmetic/source cases require no project or DSP. Key/panel/timing cases run
-the real stock UI with a disposable saved project. Playing DSP audio remains
-a separate integration gate; generated firmware and captures stay under out/.
-Without --case all cases boot the composed image; focused cases inject linked
+the real stock UI with a disposable saved project. DSP/input cases exercise
+the actual composed image; generated firmware and captures stay under out/.
+Without --case all cases boot the composed image; focused arithmetic/UI cases inject linked
 source fixtures for debugging. Missing saved-project prerequisites are errors.
 """
 from __future__ import annotations
@@ -806,8 +806,8 @@ def run_panel_cases(model, case, out, project, composed=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('remix', nargs='?', default='volume-mixer')
-    parser.add_argument('--case', choices=('registration', 'arithmetic', 'sources', 'keys', 'panels', 'timing'),
-                        help='focused injected-code gate; omitted runs every case on the composed image')
+    parser.add_argument('--case', choices=('registration', 'arithmetic', 'sources', 'keys', 'panels', 'timing', 'audio', 'input-clips'),
+                        help='focused gate (audio/input use composed image); omitted runs all composed cases')
     parser.add_argument('--model', choices=('mki', 'mkii', 'both'), default='both')
     parser.add_argument('--out', type=Path, default=ROOT / 'out/volume-mixer/verify')
     parser.add_argument('--project', type=Path, default=Path(os.environ.get('OT_PROJECT', ROOT / 'out/volume-mixer/source-project')))
@@ -815,21 +815,27 @@ def main():
     if args.case == 'registration':
         test_registration(args.remix)
         return
-    cases = (args.case,) if args.case else ('arithmetic', 'sources', 'keys', 'panels', 'timing')
-    if any(case in ('keys', 'panels', 'timing') for case in cases) and not args.project.is_dir():
-        parser.error('key/UI gate requires an existing saved project: --project or OT_PROJECT')
+    cases = (args.case,) if args.case else ('arithmetic', 'sources', 'keys', 'panels', 'timing', 'audio', 'input-clips')
+    if any(case in ('keys', 'panels', 'timing', 'audio', 'input-clips') for case in cases) and not (args.project / 'project.work').is_file():
+        parser.error('UI/audio gate requires a saved project with project.work: --project or OT_PROJECT')
     composed = None
-    if args.case is None:
+    if args.case is None or args.case in ('audio', 'input-clips'):
         test_registration(args.remix)
         composed = build_composed(args.remix, args.out / 'composed')
     for model in ('mki', 'mkii') if args.model == 'both' else (args.model,):
         for case in cases:
+            if case in ('audio', 'input-clips'):
+                from volume_mixer_audio import run_audio_cases, input_clip_cases
+                runner = run_audio_cases if case == 'audio' else input_clip_cases
+                runner(model, args.out / model / case, args.project, composed)
+                print(f'{model}: PASS {case} with playing DSP', flush=True)
+                continue
             report = (run_meter_cases(model, case, args.out / model / case, composed)
                       if case in ('arithmetic', 'sources') else
                       run_panel_cases(model, case, args.out / model / case, args.project, composed))
             print(f'{model}: PASS {case}', flush=True)
     if composed:
-        print('PASS composed volume mixer runtime; playing-DSP audio/timing and hardware remain future gates', flush=True)
+        print('PASS composed volume mixer runtime; digital port evidence only, hardware remains unmeasured', flush=True)
 
 if __name__ == '__main__':
     main()

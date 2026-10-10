@@ -81,7 +81,8 @@ def screen(port, path=None):
 
 
 @contextlib.contextmanager
-def boot_port(model: str, image: Path, out: Path, project: Path | None = None):
+def boot_port(model: str, image: Path, out: Path, project: Path | None = None,
+              audio_input: Path | None = None):
     assert model in ('mki', 'mkii')
     out.mkdir(parents=True, exist_ok=True)
     tree = out / 'card-tree'
@@ -93,6 +94,8 @@ def boot_port(model: str, image: Path, out: Path, project: Path | None = None):
     argv = [str(ROOT / 'out/emu/ot_emu'), '--image', str(image), '--card', str(card), '--interactive']
     if project is not None:
         argv.extend(['--mount', '--set', 'OCTABAM', '--project', 'PROBE', '--internal-clock'])
+    if audio_input is not None:
+        argv.extend(['--dsp', '--audio-in', str(audio_input), '--rtc', 'off'])
     if model == 'mkii':
         argv.append('--mkii')
     proc = PortProc(argv, log_path=out / 'port.log')

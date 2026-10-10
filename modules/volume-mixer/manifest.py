@@ -5,7 +5,7 @@ MODULE = Module(
     name="volume-mixer", key="VOLUME MIXER", kind=Kind.CF_PATCH,
     category=Category.MACHINES, author="repeat98", author_url="https://github.com/repeat98",
     proof=Proof.PORT,
-    proof_note="verify_volume_mixer: integer peaks, key lifecycle, actual LCD and idle refresh on MKI/MKII port; no hardware or playing-DSP proof",
+    proof_note="verify_volume_mixer: integer peaks, key lifecycle, actual LCD, playing refresh, 24-bit audio invariance and input holds on MKI/MKII port; no hardware proof",
     doc="MIDI/REC1/CUE + MIXER: live track, input and output peaks beside existing volume settings.",
     linked=(Linked("volume-meter", "modules/volume-mixer/meter.s", dram=True),
             Linked("volume-panel", "modules/volume-mixer/panel.s", dram=True)),

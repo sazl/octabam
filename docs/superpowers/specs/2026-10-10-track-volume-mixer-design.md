@@ -57,6 +57,18 @@ left-justified in 32-bit words:
 | MAIN / CUE | `0x80005e60` / `0x80005ee0`; L/R at sample*8 / sample*8+4 |
 | Inputs | `0x80005660 + ([0x46104d00] & 7)*0x100`; C/D at +0/+4, A/B at +0x80/+0x84, sample stride 8 |
 
+**Measured input-tap qualification (10 October 2026, Task 5):** this stock
+input arena follows stock input conditioning, including the input gate.
+An isolated positive ADC-stream rail over preceding silence reached this
+arena as `0x5511f9` with saved GATE 127 and `0x04c827` with GATE 0; it was
+correctly not classified as a rail. A sub-rail carrier keeps that gate open
+for the real-input test, which then delivers isolated positive and negative
+rails to each input. The indicator detects digital rails at this tap.
+Upstream ADC or analog overload attenuated before the tap is not proven
+detectable; qualifying an earlier tap requires hardware evidence. This
+measurement qualifies “raw input” throughout this design without changing
+the chosen source or adding gain controls.
+
 Evidence: `modules/usb-audio-out-tracks-main-cue/usbaudio.s`,
 `docs/firmware/STEM_REC.md` sections 18.1 and 18.5–18.7, and
 `tools/panel/KEYMAP.md` encoder measurements. Use magnitudes that handle
