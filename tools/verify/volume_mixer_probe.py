@@ -239,7 +239,8 @@ def state(port, label):
 def disassemble(out):
     ranges = [(0x4007d468, 0x4007d4a0), (0x40055678, 0x4005571e),
               (0x40056c72, 0x40056ca0), (0x4000d982, 0x4000d9b0),
-              (0x4007e760, 0x4007e818)]
+              (0x4007e760, 0x4007e818), (0x40030ffc, 0x40031008),
+              (0x40097924, 0x40097a64)]
     text = '\n'.join(subprocess.check_output([
         'm68k-elf-objdump', '-D', '-b', 'binary', '-m', 'm68k:isa-c',
         '--adjust-vma=0x40000400', f'--start-address={start}', f'--stop-address={end}', str(STOCK)], text=True)
@@ -367,17 +368,47 @@ def key_table_contract(port, model):
     return {'table': hex(table), 'press_release_handlers': observed}
 
 
-def occupied_claims():
-    from remix.registry import modules
+def occupied_claims(registry=None):
+    """Qualify selected hooks against the ledger's fixed-address write spans."""
+    if registry is None:
+        from remix.registry import modules
+        registry = modules()
     result = []
-    for name, module in modules().items():
-        for detour in module.detours:
-            size = detour.pad_to or len(detour.expect)
-            if 0x4000d960 <= detour.site < 0x4000d9b0 or detour.site in (0x40004b12, 0x40056c72):
-                result.append({'module': name, 'site': hex(detour.site), 'size': size})
+    for name, module in registry.items():
+        spans = list(module.write_spans())
+        # The ledger also reserves six bytes at a fixed linked-unit base.
+        spans.extend(('cave', unit.cave_addr, 6, f'linked unit {unit.label}')
+                     for unit in module.linked if unit.cave_addr is not None)
+        for kind, start, size, label in spans:
+            result.append({'module': name, 'kind': kind, 'site': hex(start),
+                           'size': size, 'label': label})
             for pin, (addr, data, _) in PINS.items():
-                assert addr + len(data) // 2 <= detour.site or detour.site + size <= addr, (name, pin)
+                assert addr + len(data) // 2 <= start or start + size <= addr, (
+                    f'{name}: {kind} {label} at {start:#x}+{size} overlaps {pin}')
     return result
+
+
+def test_occupied_claims():
+    """Reject non-detour writes and the asserted tail beyond a shorter pad."""
+    from remix.schema import Detour, Kind, Module, Poke
+    addr = PINS['ui'][0]
+    cases = [
+        Module('probe-poke', 'PROBE POKE', Kind.CF_PATCH, 'synthetic overlap',
+               pokes=(Poke(addr + 5, b'\0', b'\0'),)),
+        Module('probe-detour', 'PROBE DETOUR', Kind.CF_PATCH, 'asserted tail',
+               detours=(Detour(addr - 7, bytes(8), target=0, pad_to=6),)),
+    ]
+    for module in cases:
+        try:
+            occupied_claims({module.key: module})
+        except AssertionError as exc:
+            assert 'overlaps ui' in str(exc), str(exc)
+        else:
+            raise AssertionError(f'{module.key} overlap was not rejected')
+    adjacent = Module('probe-adjacent', 'PROBE ADJACENT', Kind.CF_PATCH, 'adjacent',
+                      pokes=(Poke(addr + 6, b'\0', b'\0'),))
+    result = occupied_claims({adjacent.key: adjacent})
+    assert result[0]['kind'] == 'poke' and result[0]['size'] == 1
 
 
 def run_contract_probe(model: str, out: Path) -> dict:
@@ -564,14 +595,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=('mki', 'mkii', 'both'), default='both')
     parser.add_argument('--out', type=Path, default=ROOT / 'out/volume-mixer/contracts')
-    parser.add_argument('--project', type=Path, help='saved project, copied onto scratch cards for recorder-path proof')
+    parser.add_argument('--project', type=Path, required=True,
+                        help='saved project required for complete recorder-path qualification; copied onto scratch cards')
     args = parser.parse_args()
+    if not args.project.is_dir():
+        parser.error('--project must name an existing saved-project directory')
+    test_occupied_claims()
     for model in ('mki', 'mkii') if args.model == 'both' else (args.model,):
         result = run_contract_probe(model, args.out / model)
-        print(f'{model}: PASS stock contracts, UI {result["idle_ui_hits_per_second"]} Hz', flush=True)
-        if args.project:
-            project_recorder_contract(model, args.project, args.out / model / 'project-recorder')
-            print(f'{model}: PASS recorder-path proof; REC1 deferral is required', flush=True)
+        print(f'{model}: stock baseline verified, UI {result["idle_ui_hits_per_second"]} Hz; recorder proof pending', flush=True)
+        project_recorder_contract(model, args.project, args.out / model / 'project-recorder')
+        print(f'{model}: PASS complete stock contracts including recorder-path proof', flush=True)
 
 if __name__ == '__main__':
     main()

@@ -140,9 +140,14 @@ before declaring the feature hardware-proven.
 
 ## Measured stock contracts (10 October 2026)
 
-`tools/verify/volume_mixer_probe.py --model both` boots the branch-built
+`.venv/bin/python3 tools/verify/volume_mixer_probe.py --model both
+--project out/volume-mixer/source-project --out out/volume-mixer/contracts`
+boots the branch-built
 ColdFire port on the user's stock image, injects panel events and reads the
-firmware's UART LCD stream. Both models have the following contracts:
+firmware's UART LCD stream. The project directory is a disposable copy of
+a locally supplied saved project; the probe makes its own scratch-card
+copies and requires it for a complete result. Omitting `--project` is an
+argument error. Both models have the following contracts:
 
 | Hook | Asserted bytes | Continuation and replay |
 | --- | --- | --- |
@@ -152,7 +157,10 @@ firmware's UART LCD stream. Both models have the following contracts:
 | Frame | `0x4000d98e`: `203980004800` | `0x4000d994`, `move.l 0x80004800,d0` after sampling |
 | REC1 recorder call | `0x40030ffc`: `4eb940097924` | `0x40031002`, stock call `0x40097924`; continuation discards five stack arguments |
 
-The module registry has no detour overlapping these spans. TUNER's frame
+The canonical `Module.write_spans()` registry entries and the ledger’s fixed
+linked-unit cave reservations do not overlap these spans. The probe checks
+caves, hooks, detours, pokes, table references and symbol references using
+the ledger’s conservative lengths, and records each occupied span’s kind. TUNER's frame
 hook at `0x4000d99a` and UI hook at `0x40056c72`, USB's `0x4000d9a0`,
 CF METER's `0x4000d9a6`, and STEM REC's `0x40004b12` stay distinct.
 Consequently the selected hooks do not require a TUNER conflict.
@@ -166,7 +174,8 @@ zero differences. The counter advances by one modulo four between sites.
 The ISR restores d0–d7/a0–a6 from its original stack at `0x4000d9a6`;
 the stub must restore its own stack depth and replay the load into d0.
 The following `addq`, `moveq`, `and` establish the counter and flags, so
-entry CCR is dead. EMAC state has already been restored: do not use EMAC.
+entry CCR is dead. The producer must not use EMAC; this probe does not
+qualify its state at the selected hook.
 This proves local source equivalence to the existing taps, not playing
 DSP audio or hardware timing. Those remain separate module gates.
 
