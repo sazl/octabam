@@ -127,7 +127,11 @@ stock hook spans, verified by readback, before the frame engine starts.
 This controls the DSP input phase: separately booting raw stock and the
 remix produced an unrelated eight-sample offset. No output shift or
 correlation is allowed by the passing gate. It compares every packed
-24-bit MAIN/CUE sample over closed view, all pages, navigation, repeated
+24-bit MAIN/CUE sample in a predeclared 7200 ms (317520 samples) window
+from that marker, running the script to 7400 ms so the capture includes
+the complete window. Raw lengths are reported; only the extra drain tail
+is excluded. Short captures and any in-window changed byte fail. This
+bounded comparison covers closed view, all pages, navigation, repeated
 close/reopen and PLAY/STOP while visible. Model-specific stock key-table
 callbacks must receive the exact transport press/release arguments; window
 and sequencer-state writes establish which transitions occur while visible.

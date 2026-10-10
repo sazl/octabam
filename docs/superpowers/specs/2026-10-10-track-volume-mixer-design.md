@@ -263,3 +263,12 @@ callback exactly once and removes the custom input layer. NO explicitly
 closes the custom window while CUE is still held; CUE's own sublayer
 remains until its cached release clears held state and removes it.
 All screenshots and raw disassembly stay under `out/volume-mixer/`.
+
+Final audio gate endpoint qualification: compare a predeclared 7200 ms
+(317520 samples) window from the explicit first-command marker, unshifted
+and at full 24-bit precision. Run the script through 7400 ms for drain;
+both captures must contain the full window. Report raw lengths separately.
+The port gates CF frames at task events, which can leave one different
+ESAI sample at quit; no minimum-length trimming or outcome-chosen window
+is allowed. Negative controls reject a short capture and an in-window
+changed byte. Existing transport/block/window assertions remain in force.

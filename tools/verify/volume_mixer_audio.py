@@ -13,6 +13,39 @@ from volume_mixer_probe import ROOT, PINS, STOCK
 import emu_card
 import ot_project
 
+# Predeclared proof interval, independent of observed capture lengths. The
+# script drains beyond it because CF frame gates can stop between ESAI samples.
+AUDIO_WINDOW_MS = 7200
+AUDIO_WINDOW_SAMPLES = AUDIO_WINDOW_MS * 44100 // 1000
+AUDIO_DRAIN_MS = 200
+
+
+def audio_window(pcm):
+    assert len(pcm) % 12 == 0, 'partial MAIN/CUE sample'
+    assert len(pcm) >= AUDIO_WINDOW_SAMPLES * 12, 'capture shorter than declared audio window'
+    return pcm[:AUDIO_WINDOW_SAMPLES * 12]
+
+
+def assert_audio_equal(reference, actual):
+    assert len(reference) == len(actual) == AUDIO_WINDOW_SAMPLES * 12, 'wrong declared audio window'
+    assert reference == actual, f'MAIN/CUE differ at byte {next(i for i,(a,b) in enumerate(zip(reference,actual)) if a!=b)}'
+
+
+def test_audio_window():
+    reference = bytes(AUDIO_WINDOW_SAMPLES * 12)
+    assert_audio_equal(audio_window(reference), audio_window(reference + bytes([255])*12))
+    changed = bytearray(reference)
+    changed[len(changed)//2] = 1
+    for check in (lambda: audio_window(reference[:-12]),
+                  lambda: assert_audio_equal(reference, audio_window(changed))):
+        try:
+            check()
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError('audio window negative control was accepted')
+
+
 CONTROLS = ((0x80000c50, 16), (0x80000035, 2), (0x8000002e, 2))
 CODES = dict(PLAY=0x28, STOP=0x27, MIDI=0x35, MIXER=0x30, REC1=0x2b,
              CUE=0x2a, NO=0x32, LEFT=0x34, RIGHT=0x21, YES=0x31)
@@ -80,7 +113,7 @@ def timeline(active):
     if active:
         tap(5800, 'NO'); chord(6050, 'MIDI')       # repeated reopen
     tap(6650, 'STOP')
-    events.append((7200, 'quit'))
+    events.append((AUDIO_WINDOW_MS + AUDIO_DRAIN_MS, 'quit'))
     return '\n'.join(f'{ms} {event}' for ms, event in sorted(events)) + '\n'
 
 
@@ -216,6 +249,8 @@ def validate_capture(out, card, active, symbols):
     start_sample = int(marker.group(1))
     pcm = pcm[start_sample*24:]
     selected = b''.join(pcm[i+6:i+18] for i in range(0,len(pcm),24))
+    raw_samples = len(selected)//12
+    selected = audio_window(selected)
     # Each MAIN/CUE stereo side must sound, with independent L/R content.
     channels = []
     for c in range(4):
@@ -230,13 +265,15 @@ def validate_capture(out, card, active, symbols):
     assert project_files, 'fixture project files were not found in card'
     for path, data in project_files.items():
         assert persisted.get(path) == data, f'persisted project file changed: {path}'
-    return selected, {'samples':len(selected)//12, 'controls':controls,
+    return selected, {'samples':len(selected)//12, 'raw_samples':raw_samples,
+                     'window_ms':AUDIO_WINDOW_MS, 'start_marker':start_sample, 'controls':controls,
                      'level_bytes':list(bytes.fromhex(controls[0])[::2]), 'ui':ui,
                      'transport':transport, 'pcm24_sha256':hashlib.sha256(selected).hexdigest(), 'project_files':len(project_files)}
 
 
 def run_audio_cases(model, out, project, composed):
     assert composed, 'audio requires the actual composed image'
+    test_audio_window()
     out.mkdir(parents=True, exist_ok=True)
     report = {'model':model, 'passed':False, 'precision':24, 'capture':'core0 ESAI MAIN/CUE',
               'baseline':'common composed boot, five stock handlers restored before frame engine',
@@ -245,8 +282,7 @@ def run_audio_cases(model, out, project, composed):
         card, wav = fixture(project, out)
         ref, report['stock_handlers'] = capture(model, composed[0], out/'stock-handlers', card, wav, False, composed[1])
         actual, report['module'] = capture(model, composed[0], out/'module', card, wav, True, composed[1])
-        assert len(ref) == len(actual), 'stock/module frame counts differ'
-        assert ref == actual, f'MAIN/CUE differ at byte {next(i for i,(a,b) in enumerate(zip(ref,actual)) if a!=b)}'
+        assert_audio_equal(ref, actual)
         assert report['stock_handlers']['controls'] == report['module']['controls']
         # Count actual stock frame continuations, not scheduler sample/16:
         # UI dispatch follows ISR return, so these blocks are completed.
