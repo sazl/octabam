@@ -557,6 +557,45 @@ def ui_hook(p, s, enabled):
     poke(p, addr, b'\x4e\xf9' + struct.pack('>I', s['vm_tick']) if enabled else bytes.fromhex(expected))
 
 
+
+def assert_header_raster(p, s, rows, page):
+    """A stock-rendered, safely inset glyph is the complete-raster oracle.
+
+    Compare title and counter independently against that actual LCD raster;
+    expected glyph assets are read/rendered from the user's image at runtime.
+    This catches clipping by the final window compositor, beyond TEXT's own
+    surface bounds checks, without embedding firmware font bytes in a test.
+    """
+    surface = u32(p, s['vm_window']) + 36
+    call(p, 0x40035624, surface)
+    strings = (('INTERNAL TRACKS', 'EXTERNAL INPUTS', 'MAIN / CUE')[page], f'{page+1}/3')
+    widths = []
+    for x, value in zip((3, 111), strings):
+        poke(p, BUFFER, value.encode('ascii') + b'\0')
+        width = call(p, 0x40012f30, 0x400ba876, 0xffffffff, BUFFER)
+        widths.append(width)
+        call(p, 0x40012bd8, 0x400ba876, surface, x, 32, 0xffffffff, BUFFER)
+    poke(p, 0x46c7c72c, struct.pack('>I', 1))
+    run(p, 40)
+    reference = screen(p, p.out / f'header-reference-{page}.png')
+    incomplete = []
+    for name, x, width in zip(('title', 'counter'), (3, 111), widths):
+        # Restrict the oracle to its safely inset band; stock CLEAR leaves
+        # the window's bottom framing rows, which are unrelated to this text.
+        glyph_rows = [row[x:x+width] for row in reference[20:40]]
+        occupied = [y for y, row in enumerate(glyph_rows) if any(row)]
+        assert occupied, f'{name} reference was not rendered'
+        expected = glyph_rows[min(occupied):max(occupied)+1]
+        assert len(expected) >= 5, f'{name} reference is itself clipped'
+        actual = [[1-v for v in row[x:x+width]] for row in rows[:9]]
+        matches = any(actual[y:y+len(expected)] == expected for y in range(10-len(expected)))
+        if not matches:
+            incomplete.append(name)
+    assert not incomplete, f'page {page}: incomplete header glyphs: {incomplete}'
+    # Leave the actual tested panel on screen for subsequent inspection.
+    call(p, s['vm_draw'])
+    run(p, 40)
+
 def test_pixels(p, s):
     """Catches L/R collapse, hidden 100 line, wrong volume position, and clipping."""
     ui_hook(p, s, False)
@@ -587,6 +626,7 @@ def test_pixels(p, s):
                 assert rows[46][14] and rows[25][30] and rows[19][46], '0/100/127 markers misplaced'
             if page == 1:
                 assert rows[10][43] and not rows[10][13], 'clipped B label not inverted'
+            assert_header_raster(p, s, rows, page)
             call(p, s['vm_close'])
     finally:
         for address, data in original:

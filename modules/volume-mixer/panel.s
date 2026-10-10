@@ -381,7 +381,7 @@ vm_draw:
  lea vm_titles,%a0
  moveal %a0@(0,%d0:l:4),%a0
  moveq #3,%d0
- moveq #2,%d1
+ moveq #3,%d1
  bsr.w vm_text
  movel vm_page,%d0
  addql #1,%d0
@@ -392,7 +392,7 @@ vm_draw:
  lea %sp@(12),%sp
  moveal %a6,%a0
  moveq #111,%d0
- moveq #2,%d1
+ moveq #3,%d1
  bsr.w vm_text
  moveq #0,%d0
  moveq #0,%d1
