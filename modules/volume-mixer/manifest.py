@@ -17,7 +17,7 @@ MODULE = Module(
         Detour(0x40055678, bytes.fromhex("2f032f02262f000c"), "volume-panel", "vm_midi",
                "consume chord MIDI release; replay eight-byte prologue", pad_to=8),
         Detour(0x40030ffc, bytes.fromhex("4eb940097924"), "volume-panel", "vm_rec_router",
-               "defer REC1 recording press until release or chord cancellation", kind="jsr"),
+               "defer ONE/ONE2 REC1; preserve native HOLD edges", kind="jsr"),
         Detour(0x40056c92, bytes.fromhex("4ab946104ca8"), "volume-panel", "vm_tick",
                "UI refresh; replay stock UI test"),
     ),

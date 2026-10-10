@@ -12,6 +12,7 @@ One view contains three pages, in order:
 
 1. MIDI held, then MIXER: T1–T8, each with L/R bars and one track LEVEL value.
 2. REC1 held, then MIXER: A–D, with independent activity and clip indicators.
+   During native HOLD recording use MIDI+MIXER, then RIGHT; REC1 timing stays stock.
 3. CUE held, then MIXER: MAIN and CUE, each with L/R bars and one volume value.
 
 LEFT and RIGHT move between pages and stop at the endpoints. Each volume
@@ -24,8 +25,9 @@ adds `!`, as in the approved B! example.
 MIXER alone and FUNC+MIXER retain stock behavior. NO or MIXER closes the
 custom view. Transport remains usable. Closing or eviction removes the
 custom input layer and restores the underlying display. Opening with MIDI
-must not leave MIDI mode changed; REC1/CUE chords must not perform unrelated
-recording or cue actions. Modifiers must be released without stuck keys.
+must not leave MIDI mode changed; accepted REC1/CUE shortcuts must not perform
+unrelated recording or cue actions. Native HOLD recording keeps its stock
+REC1 edges and uses the alternate input-page gesture above. Modifiers must be released without stuck keys.
 
 ## Sources and meaning
 
@@ -39,7 +41,7 @@ Existing controls are read without writing them:
 
 | Value | Source |
 | --- | --- |
-| T1–T8 LEVEL | halfwords at `0x80000c50 + 2*track` |
+| T1–T8 LEVEL | bytes at `0x80000c50 + 2*track` (two-byte stride) |
 | MAIN / CUE | bytes `0x80000035` / `0x80000036` |
 | A and B gain | shared byte `0x8000002f` |
 | C and D gain | shared byte `0x8000002e` |
@@ -217,22 +219,39 @@ FUNC+MIDI and FUNC+MIXER open their stock views without changing MIDI mode.
 Both release orders, standalone taps, and the stock mixer open/close path
 are covered by captured state and LCD traces.
 
-**REC1 requires deferral.** A copied saved project with mode byte 2 follows
-the ordinary held-key path. With its current track's mode byte temporarily
-set to 4 in emulator RAM, REC1 press reaches `0x40097924` and the recording
-command routine `0x400977cc` *before MIXER is pressed*, on both models.
-Clearing held state afterward cannot undo that command. At `0x40030ffc`
-the five stack arguments are `(track, recorder_mode, key, edge, arg)`;
-REC1 key is `0x2b`. Intercept this narrow call, retain recording-producing
-press arguments, and cancel both recording edges when MIXER consumes the
-chord. For an unconsumed release, call the saved press using a separate
-argument copy, then call the current release. The stock router rewrites
-its argument stack in its tail call, so the saved arguments must not
-share the pending release's stack. Preserve the ordinary held-key/UI path.
-The implementation ruling's user-visible cost is that standalone REC1 in
-this recording mode starts recording on release. No early flush on other keys is proved
-or required. Production tests must check this adverse mode as well as the
-saved project's original mode.
+**REC1 depends on the native recorder trigger mode.** The router call at
+`0x40030ffc` receives `(track, TRIG, key, edge, arg)`: TRIG is ONE=0,
+ONE2=1, HOLD=2, distinct from the machine type (PICKUP=4). ONE/ONE2
+recording presses are deferred until release so a subsequent MIXER can
+consume both edges. Their standalone recording starts on release. A ONE2 take finished at the same subsequent
+REC2 event is shorter by that withheld press interval; only HOLD preserves
+its native held recording duration. The saved arguments need an independent stack copy because the stock router
+rewrites its caller's arguments for a tail call.
+
+HOLD press and release route natively. When REC1 actually entered that
+recording-sensitive path, REC1+MIXER uses the stock mixer; open the input
+page using MIDI+MIXER, then RIGHT. Ordinary REC1 with no recording role
+retains the shortcut. This replaces the earlier unconditional-deferral
+ruling: a running stock HOLD captured 25,632 samples during a 580 ms
+press, while the old deferral captured none of that interval and began
+recording after release, remaining active 200 ms later.
+
+Deferred presses cancel on track/part/bank, machine, TRIG and stock
+recording-context changes. A raw physical release can precede its queued
+UI callback, so raw-up alone must not cancel a pending standalone press.
+Native release completes same-context replay. A fresh routed press clears
+any consumed-release marker left when a prior release took another stock
+path. HOLD shortcut eligibility expires on raw release, even if the outer
+handler no longer calls the router. Tests cover bypassed releases and the
+next gesture, both models and both release orders.
+
+Native UART encoder round trips qualify the displayed control sources:
+T1/T2/T8 LEVEL changes only the byte at `0x80000c50 + 2*track`, leaving
+the companion byte and other tracks intact. Stock store `0x4004ec5a` is
+`moveb`, not a halfword store. AB/CD gains update both displayed members
+of their pair; MAIN/CUE update their respective output number. Tests
+restore controls by inverse encoder turns and verify renderer numbers,
+separately from direct-memory raster fixtures.
 
 A full display needs `WCREATE(128, 64, -1, 0, 5, closed_callback)`:
 the stock constructor adds one to its x origin, so an x argument of zero

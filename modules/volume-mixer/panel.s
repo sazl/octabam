@@ -1,7 +1,7 @@
 /* VOLUME MIXER: measured stock key/window contracts, OS 1.40C.
  * Drawing and snapshot normalization run in the UI task, never the ISR.
- * REC1's recording router press is deferred until release, so a subsequent
- * MIXER can consume both edges. Standalone mode-4 recording starts on release.
+ * ONE/ONE2 router presses defer until release so MIXER can consume both
+ * edges. HOLD routes natively and disables the recording-sensitive shortcut.
  */
 .text
 .globl vm_mixer,vm_midi,vm_rec_router,vm_open,vm_close,vm_evicted
@@ -34,6 +34,8 @@ vm_mixer_midi:
  moveq #0,%d0
  bra.w vm_open
 vm_mixer_rec:
+ tstl vm_rec_hold
+ bne.w vm_mixer_stock
  tstl vm_rec_pending
  beq.s 1f
  clrl vm_rec_pending
@@ -71,7 +73,18 @@ vm_rec_router:
  cmpil #0x2b,%d0
  bne.w vm_rec_stock
  tstl %sp@(16)
- beq.s vm_rec_release
+ beq.w vm_rec_release
+ clrl vm_rec_pending
+ movel vm_pending_releases,%d0
+ andil #-3,%d0
+ movel %d0,vm_pending_releases
+ movel %sp@(8),%d0
+ cmpil #2,%d0
+ bne.s 2f
+ moveq #1,%d0
+ movel %d0,vm_rec_hold
+ bra.w vm_rec_stock
+2: clrl vm_rec_hold
  lea %sp@(4),%a0
  lea vm_rec_args,%a1
  moveq #5,%d0
@@ -80,9 +93,39 @@ vm_rec_router:
  bne.s 1b
  moveq #1,%d0
  movel %d0,vm_rec_pending
+ moveb 0x100b14cf,%d0
+ moveb %d0,vm_rec_part
+ movel 0x46c82456,%d0
+ movel %d0,vm_rec_bank
+ moveal %d0,%a0
+ moveq #0,%d0
+ moveb vm_rec_part,%d0
+ movel #6322,%d1
+ mulul %d1,%d0
+ addal %d0,%a0
+ addal #0x8eda2,%a0
+ movel vm_rec_args,%d0
+ moveb %a0@(0,%d0:l),%d0
+ moveb %d0,vm_rec_machine
+ movel 0x460d1736,%d0
+ movel %d0,vm_rec_setup
+ movel 0x460d5db4,%d0
+ movel %d0,vm_rec_setup_page
+ movel 0x460fab40,%d0
+ movel %d0,vm_rec_grid
+ movel 0x80000012,%d0
+ movel %d0,vm_rec_midi
  rts
 vm_rec_release:
- movel vm_pending_releases,%d0
+ movel %d2,%sp@-
+ bsr.w vm_rec_cleanup
+ movel %sp@+,%d2
+ tstl vm_rec_hold
+ beq.s 2f
+ clrl vm_rec_hold
+ clrl vm_rec_pending
+ bra.w vm_rec_stock
+2: movel vm_pending_releases,%d0
  btst #1,%d0
  beq.s 1f
  movel vm_pending_releases,%d0
@@ -91,8 +134,14 @@ vm_rec_release:
  clrl vm_rec_pending
  rts
 1: tstl vm_rec_pending
- beq.s vm_rec_stock
+ beq.w vm_rec_stock
  clrl vm_rec_pending
+ movel %sp@(4),%d0
+ cmpl vm_rec_args,%d0
+ bne.w vm_rec_stock
+ movel %sp@(8),%d0
+ cmpl vm_rec_args+4,%d0
+ bne.w vm_rec_stock
  lea vm_rec_args,%a0
  movel %a0@(16),%sp@-
  movel %a0@(12),%sp@-
@@ -168,12 +217,69 @@ vm_redraw_now:
 vm_tick:
  lea %sp@(-60),%sp
  movem.l %d0-%d7/%a0-%a6,%sp@
+ bsr.w vm_rec_cleanup
  movel 0xfc07c00c,%d0
  bsr.w vm_refresh
  movem.l %sp@,%d0-%d7/%a0-%a6
  lea %sp@(60),%sp
  tstl 0x46104ca8
  jmp 0x40056c98
+/* Called on the stock UI timer event. A routing-context change cancels
+ * deferred ONE/ONE2 presses. Raw-up alone cannot cancel them: the queued
+ * release callback may not have run yet. A fresh routed press retires a
+ * consumed-release marker left by a release routed elsewhere. HOLD shortcut
+ * eligibility is latched for the physical hold.
+ */
+vm_rec_cleanup:
+ moveb VM_ROWS+5,%d0
+ btst #3,%d0
+ bne.s 1f
+ clrl vm_rec_hold
+1: tstl vm_rec_pending
+ beq.w 3f
+ movel 0x460d1736,%d0
+ cmpl vm_rec_setup,%d0
+ bne.w 2f
+ movel 0x460d5db4,%d0
+ cmpl vm_rec_setup_page,%d0
+ bne.w 2f
+ movel 0x460fab40,%d0
+ cmpl vm_rec_grid,%d0
+ bne.w 2f
+ movel 0x80000012,%d0
+ cmpl vm_rec_midi,%d0
+ bne.w 2f
+
+ moveq #0,%d0
+ moveb 0x100b14cc,%d0
+ cmpl vm_rec_args,%d0
+ bne.s 2f
+ moveb 0x100b14cf,%d1
+ cmpb vm_rec_part,%d1
+ bne.s 2f
+ movel 0x46c82456,%d1
+ cmpl vm_rec_bank,%d1
+ bne.s 2f
+ moveal %d1,%a0
+ moveq #0,%d1
+ moveb vm_rec_part,%d1
+ movel #6322,%d2
+ mulul %d2,%d1
+ addal %d1,%a0
+ addal #0x8eda2,%a0
+ moveb %a0@(0,%d0:l),%d1
+ cmpb vm_rec_machine,%d1
+ bne.s 2f
+ moveq #12,%d2
+ mulul %d2,%d0
+ moveq #0,%d1
+ addal #0x5e3,%a0
+ moveb %a0@(0,%d0:l),%d1
+ cmpl vm_rec_args+4,%d1
+ beq.s 3f
+2: clrl vm_rec_pending
+3: rts
+
 /* Callable scheduling helper: d0 = wrapping 132 MHz DTCN3 count.
  * Maintain the absolute 40 ms grid over 60 Hz UI wakeups. At >=2 periods
  * late restart from now once, without subsequent catch-up bursts.
@@ -419,7 +525,7 @@ vm_track_loop:
  bsr.w vm_center
  lea 0x80000c50,%a0
  moveq #0,%d7
- movew %a0@(0,%d5:l:2),%d7
+ moveb %a0@(0,%d5:l:2),%d7
  bsr.w vm_rail
  movel %d7,%d0
  bsr.w vm_number
@@ -574,6 +680,14 @@ VM_ENCS:
 .balign 4
 vm_layer_live: .long 0
 vm_rec_pending: .long 0
+vm_rec_hold: .long 0
+vm_rec_bank: .long 0
+vm_rec_part: .long 0
+vm_rec_machine: .long 0
+vm_rec_setup: .long 0
+vm_rec_setup_page: .long 0
+vm_rec_grid: .long 0
+vm_rec_midi: .long 0
 vm_rec_args: .space 20
 vm_track_rails:
  .long 2,11,0,2,18,11,2,2,34,11,4,2,50,11,6,2

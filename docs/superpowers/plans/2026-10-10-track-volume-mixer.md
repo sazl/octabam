@@ -102,3 +102,16 @@ Assembly conventions: callable helpers receive arguments in registers, preserve 
 - [ ] Run `.venv/bin/python3 tools/verify/verify_volume_mixer.py volume-mixer` and `OT_PROJECT=<local-project> make check REMIX=volume-mixer`. If no saved project is available, finish independent checks and report the precise unmet project gate; do not claim full audio validation.
 - [ ] Before opening a PR, fetch/rebase onto origin/main and run `make reach RUN=1 KEEP=1` on that tree. Fix failures and list each command/result in the PR body. No hardware-proven claim until MKI and MKII unit checks are recorded.
 - [ ] Request an independent whole-branch review of requirements, live-register preservation, interrupt work, snapshot safety, key releases and gate evidence. Resolve actionable findings and present the completed change with remaining hardware/project limitations.
+
+## Final-review corrections
+
+- Qualify recorder TRIG independently of PICKUP machine type. Preserve native
+  HOLD intervals; its recording-sensitive REC1 shortcut uses stock MIXER,
+  with MIDI+MIXER then RIGHT providing the inputs page. ONE/ONE2 defer only
+  with proved running-recorder outcomes, including final state and duration.
+- Cancel deferred presses on changed routing context without racing a queued
+  release. Qualify consumed chord, bypassed release and next-gesture cleanup.
+- LEVEL is a byte at a two-byte stride. Native T1/T2/T8 encoder round trips,
+  pair-gain and MAIN/CUE edits must drive the renderer and restore controls.
+- Re-run the registered stock-contract census while excluding only the exact
+  investigated module; retain every other owner's complete write-span guard.

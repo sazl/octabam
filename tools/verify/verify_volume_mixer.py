@@ -29,6 +29,8 @@ BUFFER = SCRATCH + 0xe000
 def test_registration(remix='volume-mixer'):
     """The ledger must reject a real claimed span and allow TUNER's sites."""
     from remix import registry, ledger
+    from volume_mixer_probe import test_occupied_claims
+    test_occupied_claims()
     from remix.schema import Detour, Gate, Kind, Module
     module = registry.modules().get('VOLUME MIXER')
     assert module is not None, 'VOLUME MIXER is missing from the module registry'
@@ -574,43 +576,97 @@ def test_eviction(p, s):
 
 
 def test_recorder_deferral(p, s):
-    """Real saved project mode 4: neither recording edge may escape a chord."""
-    bank, track = peek(p, 0x100b14cf, 1)[0], peek(p, 0x100b14cc, 1)[0]
-    address = u32(p, 0x46c82456) + 0x8eda2 + bank * 0x18b2 + track
-    old = peek(p, address, 1)
+    """Real UI routing and cancellation; running durations have a separate gate."""
+    part, track = peek(p, 0x100b14cf, 1)[0], peek(p, 0x100b14cc, 1)[0]
+    base = u32(p, 0x46c82456) + part*0x18b2
+    address, trig_addr = base + 0x8eda2 + track, base + 0x8f385 + track*12
+    old, old_trig = peek(p,address,1), peek(p,trig_addr,1)
     try:
-        for mode in (old, b'\x04'):
-            poke(p, address, mode)
-            for closer in (None, 'NO', 'TEMPO'):
-                for order in (False, True):
-                    before_record = peek(p, 0x800049d8 + track * 0xa8, 0xa8)
-                    watch(p, [0x40097924, 0x400977cc])
-                    key(p, 'REC1')
-                    assert not hits(p), 'recording press escaped before MIXER'
-                    key(p, 'MIXER')
+        poke(p,address,b'\x04')
+        for trig in (0,1):
+            poke(p,trig_addr,bytes([trig]))
+            for closer in (None,'NO','TEMPO'):
+                for order in (False,True):
+                    watch(p,[0x40097924,0x400977cc])
+                    key(p,'REC1'); assert not hits(p)
+                    assert u32(p,s['vm_rec_pending'])
+                    key(p,'MIXER')
                     if closer:
-                        key(p, 'MIXER', False)
-                        tap(p, closer)
-                        key(p, 'REC1', False)
+                        key(p,'MIXER',False); tap(p,closer); key(p,'REC1',False)
                     else:
-                        for name in (['REC1', 'MIXER'] if order else ['MIXER', 'REC1']):
-                            key(p, name, False)
-                    assert not hits(p), 'consumed REC1 called recording router'
-                    assert peek(p, 0x800049d8 + track * 0xa8, 0xa8) == before_record
-                    tap(p, 'NO')
-                    assert not u32(p, 0x460d10d0)
-            watch(p, [0x40097924, 0x400977cc])
-            key(p, 'REC1')
-            assert not hits(p), 'standalone recording must be deferred to release'
-            key(p, 'REC1', False)
-            records = hits(p)
-            if mode == b'\x04':
-                routers = [h for h in records if h[1] == 0x40097924]
-                assert [h[10:12] for h in routers] == [[0x2b, 1], [0x2b, 0]], records
-                assert any(h[1] == 0x400977cc for h in records)
+                        for name in (['REC1','MIXER'] if order else ['MIXER','REC1']): key(p,name,False)
+                    assert not hits(p), 'consumed recording chord escaped'
+                    assert not u32(p,s['vm_rec_pending'])
+                    tap(p,'NO')
+            watch(p,[0x40097924,0x400977cc])
+            key(p,'REC1'); assert not hits(p)
+            key(p,'REC1',False)
+            routers = [h for h in hits(p) if h[1] == 0x40097924]
+            assert [h[10:12] for h in routers] == [[0x2b,1],[0x2b,0]], routers
+            # The stock outer handler recomputes its path on each edge.
+            for context in ('track','machine','trig'):
+                watch(p,[0x40097924])
+                key(p,'REC1'); assert u32(p,s['vm_rec_pending'])
+                if context == 'track':
+                    other = (track+1)%8
+                    p.proc.command(f'key 34 {1 << other}','ok'); run(p,80)
+                    p.proc.command('key 34 0','ok'); run(p,80)
+                else:
+                    poke(p,address if context == 'machine' else trig_addr,b'\x02')
+                    run(p,80)
+                assert not u32(p,s['vm_rec_pending']), context
+                key(p,'REC1',False)
+                assert not any(h[11] for h in hits(p)), 'stale press was replayed'
+                if context == 'track':
+                    p.proc.command(f'key 34 {1 << track}','ok'); run(p,80)
+                    p.proc.command('key 34 0','ok'); run(p,80)
+                poke(p,address,b'\x04'); poke(p,trig_addr,bytes([trig]))
+        # Snapshot every additional stock outer-handler dependency. Mutate
+        # disposable routing state, run the actual tick, then restore before
+        # releasing so no fabricated pointer reaches stock code.
+        poke(p,trig_addr,b'\x01')
+        for context_addr,size in ((0x100b14cf,1),(0x46c82456,4),(0x460d1736,4),
+                                  (0x460d5db4,4),(0x460fab40,4),(0x80000012,4)):
+            watch(p,[0x40097924])
+            key(p,'REC1'); assert u32(p,s['vm_rec_pending'])
+            before=peek(p,context_addr,size)
+            poke(p,context_addr,(int.from_bytes(before,'big')^1).to_bytes(size,'big'))
+            run(p,20)
+            assert not u32(p,s['vm_rec_pending']),hex(context_addr)
+            poke(p,context_addr,before)
+            key(p,'REC1',False)
+            assert not any(h[11] for h in hits(p)), 'context-cancelled press replayed'
+        for trig in (0,1):
+            poke(p,trig_addr,bytes([trig]))
+            key(p,'REC1');key(p,'MIXER');key(p,'MIXER',False);tap(p,'NO')
+            assert u32(p,s['vm_pending_releases']) & 2
+            poke(p,address,b'\x02');key(p,'REC1',False)
+            poke(p,address,b'\x04')
+            watch(p,[0x40097924])
+            key(p,'REC1');key(p,'REC1',False)
+            assert [h[10:12] for h in hits(p)] == [[0x2b,1],[0x2b,0]], 'stale consumed marker suppressed next gesture'
+            assert not u32(p,s['vm_rec_pending']) and not (u32(p,s['vm_pending_releases']) & 2)
+        poke(p,trig_addr,b'\x02')
+        for order in (False,True):
+            watch(p,[0x40097924])
+            key(p,'REC1')
+            assert u32(p,s['vm_rec_hold']) and not u32(p,s['vm_rec_pending'])
+            assert [h[10:12] for h in hits(p)] == [[0x2b,1]]
+            key(p,'MIXER'); assert not u32(p,s['vm_window'])
+            for name in (['REC1','MIXER'] if order else ['MIXER','REC1']): key(p,name,False)
+            assert [h[10:12] for h in hits(p)] == [[0x2b,0]]
+            assert not u32(p,s['vm_rec_hold'])
+            tap(p,'MIXER') # close stock mixer
+        chord(p,'MIDI'); tap(p,'RIGHT')
+        assert u32(p,s['vm_window']) and u32(p,s['vm_page']) == 1
+        tap(p,'NO')
+        # HOLD release can bypass the router after changing the machine.
+        key(p,'REC1'); assert u32(p,s['vm_rec_hold'])
+        poke(p,address,b'\x02'); key(p,'REC1',False)
+        assert not u32(p,s['vm_rec_hold']) and not u32(p,s['vm_rec_pending'])
     finally:
-        poke(p, address, old)
-        p.proc.command('watch off', 'ok')
+        poke(p,address,old); poke(p,trig_addr,old_trig)
+        p.proc.command('watch off','ok')
 
 
 
@@ -708,12 +764,64 @@ def assert_header_raster(p, s, rows, page):
     call(p, s['vm_draw'])
     run(p, 40)
 
+def test_encoder_sources(p, s):
+    """Stock UART encoder edits must reach the exact numbers our renderer reads."""
+    def turn(row, delta):
+        p.proc.command(f'key {row} {delta & 255}', 'ok')
+        run(p, 120)
+    def shown(page):
+        call(p, s['probe_open'], page)
+        watch(p, [s['vm_number']])
+        call(p, s['vm_draw'])
+        result = [h[2] for h in hits(p)]
+        p.proc.command('watch off', 'ok')
+        call(p, s['vm_close'])
+        return result
+    track = peek(p, 0x100b14cc, 1)[0]
+    cases = [(f'LEVEL T{t+1}', 0x36, 0x80000c50 + 2*t, 1, 0, [2*t+1]) for t in (0,1,7)] + [
+             ('GAIN AB', 0x32, 0x8000002f, 1, 1, [0,1]),
+             ('GAIN CD', 0x35, 0x8000002e, 1, 1, [2,3]),
+             ('MAIN', 0x30, 0x80000035, 1, 2, [0]),
+             ('CUE', 0x33, 0x80000036, 1, 2, [1])]
+    evidence = []
+    for name, row, address, size, page, positions in cases:
+        is_level = name.startswith('LEVEL')
+        if is_level:
+            target = (address - 0x80000c50) // 2
+            p.proc.command(f'key 34 {1 << target}', 'ok'); run(p, 80)
+            p.proc.command('key 34 0', 'ok'); run(p, 80)
+            assert peek(p, 0x100b14cc, 1)[0] == target
+        old = int.from_bytes(peek(p, address, size), 'big')
+        delta = (1 if is_level else 2) * (1 if old < 120 else -1)
+        before_levels = peek(p, 0x80000c50, 16)
+        if not is_level: tap(p, 'MIXER')
+        turn(row, delta)
+        changed = int.from_bytes(peek(p, address, size), 'big')
+        assert (changed-old)*delta > 0, (name, old, changed, delta)
+        if is_level:
+            expected = bytearray(before_levels); expected[2*target] = changed
+            assert peek(p, 0x80000c50,16) == expected, 'encoder modified another track or companion byte'
+        if not is_level: tap(p, 'MIXER')
+        values = shown(page)
+        assert all(values[i] == changed for i in positions), (name, changed, values)
+        if not is_level: tap(p, 'MIXER')
+        turn(row, -delta)
+        assert int.from_bytes(peek(p, address, size), 'big') == old, name
+        if not is_level: tap(p, 'MIXER')
+        assert all(shown(page)[i] == old for i in positions), name
+        evidence.append({'control':name, 'before':old, 'encoder_delta':delta, 'after':changed,
+                         'restored':old, 'display_positions':positions})
+    p.proc.command(f'key 34 {1 << track}', 'ok'); run(p,80)
+    p.proc.command('key 34 0','ok'); run(p,80)
+    p.encoder_result = evidence
+
+
 def test_pixels(p, s):
     """Catches L/R collapse, hidden 100 line, wrong volume position, and clipping."""
     ui_hook(p, s, False)
     original = [(a, peek(p, a, n)) for a, n in ((0x80000c50,16),(0x8000002e,2),(0x80000035,2))]
     try:
-        poke(p, 0x80000c50, struct.pack('>8H', 0,100,127,88,100,76,104,92))
+        poke(p, 0x80000c50, bytes(v for level in (0,100,127,88,100,76,104,92) for v in (level, 0x5a)))
         poke(p, 0x8000002e, bytes([80,96]))
         poke(p, 0x80000035, bytes([127,0]))
         for page in range(3):
@@ -787,7 +895,7 @@ def run_panel_cases(model, case, out, project, composed=None):
             s = load_composed(p, composed) if composed else load_panel(p)
             tests = {'keys':[test_chords_both_models, test_release_after_close, test_navigation,
                              test_eviction, test_stock_forwarding, test_recorder_deferral],
-                     'panels':[test_pixels], 'timing':[test_refresh_wrap]}[case]
+                     'panels':[test_encoder_sources, test_pixels], 'timing':[test_refresh_wrap]}[case]
             for test in tests:
                 test(p, s)
                 report['tests'].append(test.__name__)
@@ -795,6 +903,8 @@ def run_panel_cases(model, case, out, project, composed=None):
             if case == 'timing':
                 report['ui_costs'] = panel_costs_and_preservation(p, s)
                 report['tests'].append('panel_costs_and_preservation')
+            if hasattr(p, 'encoder_result'):
+                report['encoder_round_trips'] = p.encoder_result
             if hasattr(p, 'timing_result'):
                 report['timing'] = p.timing_result
             report['passed'] = True
@@ -806,7 +916,7 @@ def run_panel_cases(model, case, out, project, composed=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('remix', nargs='?', default='volume-mixer')
-    parser.add_argument('--case', choices=('registration', 'arithmetic', 'sources', 'keys', 'panels', 'timing', 'audio', 'input-clips'),
+    parser.add_argument('--case', choices=('registration', 'arithmetic', 'sources', 'keys', 'panels', 'timing', 'audio', 'input-clips', 'recorders'),
                         help='focused gate (audio/input use composed image); omitted runs all composed cases')
     parser.add_argument('--model', choices=('mki', 'mkii', 'both'), default='both')
     parser.add_argument('--out', type=Path, default=ROOT / 'out/volume-mixer/verify')
@@ -815,18 +925,19 @@ def main():
     if args.case == 'registration':
         test_registration(args.remix)
         return
-    cases = (args.case,) if args.case else ('arithmetic', 'sources', 'keys', 'panels', 'timing', 'audio', 'input-clips')
-    if any(case in ('keys', 'panels', 'timing', 'audio', 'input-clips') for case in cases) and not (args.project / 'project.work').is_file():
+    cases = (args.case,) if args.case else ('arithmetic', 'sources', 'keys', 'panels', 'timing', 'audio', 'input-clips', 'recorders')
+    if any(case in ('keys', 'panels', 'timing', 'audio', 'input-clips', 'recorders') for case in cases) and not (args.project / 'project.work').is_file():
         parser.error('UI/audio gate requires a saved project with project.work: --project or OT_PROJECT')
     composed = None
-    if args.case is None or args.case in ('audio', 'input-clips'):
+    if args.case is None or args.case in ('audio', 'input-clips', 'recorders'):
         test_registration(args.remix)
         composed = build_composed(args.remix, args.out / 'composed')
     for model in ('mki', 'mkii') if args.model == 'both' else (args.model,):
         for case in cases:
-            if case in ('audio', 'input-clips'):
+            if case in ('audio', 'input-clips', 'recorders'):
                 from volume_mixer_audio import run_audio_cases, input_clip_cases
-                runner = run_audio_cases if case == 'audio' else input_clip_cases
+                from volume_mixer_recorder import run_recorder_cases
+                runner = {'audio':run_audio_cases,'input-clips':input_clip_cases,'recorders':run_recorder_cases}[case]
                 runner(model, args.out / model / case, args.project, composed)
                 print(f'{model}: PASS {case} with playing DSP', flush=True)
                 continue

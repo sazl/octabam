@@ -230,7 +230,8 @@ def validate_capture(out, card, active, symbols):
     assert project_files, 'fixture project files were not found in card'
     for path, data in project_files.items():
         assert persisted.get(path) == data, f'persisted project file changed: {path}'
-    return selected, {'samples':len(selected)//12, 'controls':controls, 'ui':ui,
+    return selected, {'samples':len(selected)//12, 'controls':controls,
+                     'level_bytes':list(bytes.fromhex(controls[0])[::2]), 'ui':ui,
                      'transport':transport, 'pcm24_sha256':hashlib.sha256(selected).hexdigest(), 'project_files':len(project_files)}
 
 

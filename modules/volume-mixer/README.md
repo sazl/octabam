@@ -8,7 +8,7 @@ use stock behavior. Encoders and PLAY/STOP continue through stock dispatch.
 No independent gain control is added.
 
 Tracks show separate L/R activity **post-FX, pre-LEVEL** alongside each
-track's existing LEVEL. Inputs A–D show raw input activity; A/B display
+track's existing LEVEL byte (two-byte track stride). Inputs A–D show raw input activity; A/B display
 their common stock gain, and C/D theirs. MAIN/CUE show separate L/R final
 digital output feeds beside existing main/cue volume. Every scale is 0–127
 with a fixed horizontal 100 reference. The input tap is the stock ColdFire input arena, after the stock input
@@ -25,12 +25,20 @@ views skip collection; reopening discards stale peaks and clips.
 
 ## Key and window cost
 
-REC1's recording-producing stock-router press is deferred until release,
-so REC1 then MIXER can consume both recording edges. In recorder mode 4,
-standalone REC1 therefore starts recording **on release**. Consumed MIDI
-and REC1 releases remain suppressed after explicit close or eviction;
-CUE's stock release clears its held state. No early flush on other keys
-is proved or implemented.
+For native recorder TRIG=ONE or ONE2, REC1's recording press is deferred
+until release so REC1 then MIXER can consume both recording edges.
+Standalone recording in that context starts **on release**. ONE2 takes ended
+at the same later REC2 time are shorter by that deferred interval; this is
+an intentional timing tradeoff, not recording-duration invariance. TRIG=HOLD
+keeps stock press-to-start/release-to-stop timing; when REC1 is recording,
+REC1+MIXER opens the stock mixer. Reach the input page with **MIDI+MIXER,
+then RIGHT**. REC1 without a recording role still opens inputs directly.
+
+Deferred presses cancel when the selected track, part, bank, machine,
+TRIG or stock recording context changes. Consumed releases survive close
+and eviction; a later press retires any stale consumed marker after a
+release routed elsewhere. Raw-up alone cannot cancel a deferred press:
+the queued release callback may still need it. CUE releases use stock.
 
 The full-screen class-5 stock window is evicted by another class-5 view
 (for example the stock TEMPO opener). Its close callback removes the
@@ -82,8 +90,8 @@ instructions, **not chip cycles, hardware timing or WCET**:
 | Closed collection | 3 |
 | Snapshot / masked exchange | 514 / 143 |
 | Masked reset | 160 |
-| UI hook, not due | 15 |
-| Tracks / inputs / outputs redraw | 22770 / 13921 / 13011 |
+| UI hook, not due (no pending gesture) | 23 |
+| Tracks / inputs / outputs redraw | 22321 / 13929 / 13019 |
 
 Two seconds without keys produced 49 draws on each model (2.0022 / 2.0027 s).
 Interrupt-masked snapshot/reset operations restore the saved SR. The
@@ -98,14 +106,14 @@ OT_PROJECT=<saved-project-copy> .venv/bin/python3 tools/verify/verify_volume_mix
 ```
 
 The registered default gate runs every arithmetic/source/key/panel/timing
-and playing-DSP case on both models against the **actual composed runtime**, verifies its
+and playing-DSP/recorder case on both models against the **actual composed runtime**, verifies its
 boot-depacked executable bytes and installed detours, then calls its
 symbols through test-only wrappers. Only the call mailbox/wrappers are
 injected. If TUNER occupies the mailbox's UI queue-head site, the test
 mailbox chains its validated composed target; PC/register/stack traces
 prove TUNER still executes and replays the queue-head instruction.
 Focused arithmetic/UI `--case` runs preserve standalone source-linked
-fixtures for local debugging; audio/input cases always use the composed
+fixtures for local debugging; audio/input/recorder cases always use the composed
 image. UI and audio cases require a saved project (`--project`,
 `OT_PROJECT`, or ignored `out/volume-mixer/source-project`); missing data
 is an error. Every boot uses a disposable card copy. Generated firmware,
@@ -138,3 +146,9 @@ These are deterministic lockstep port results. They do not prove
 startup equivalence to an unmodified stock image, physical ADC overload
 detection, chip timing, asynchronous hardware races or uninterrupted
 UI/audio on a physical MKI/MKII.
+
+Native encoder round trips on both models cover T1/T2/T8 LEVEL, paired AB/CD
+gains and MAIN/CUE. The recorder gate uses persisted PICKUP assignments and
+the real frame engine, observes both native recorder banks, and checks held
+interval progression plus final length/state for ONE, ONE2 and HOLD. Direct
+control-memory raster fixtures are separate from this source qualification.

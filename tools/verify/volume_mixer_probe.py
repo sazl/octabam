@@ -378,6 +378,10 @@ def occupied_claims(registry=None):
         registry = modules()
     result = []
     for name, module in registry.items():
+        # The investigated module owns these exact pins by construction.
+        # Only its canonical identity is excluded; every other owner remains.
+        if name == "VOLUME MIXER" and module.name == "volume-mixer":
+            continue
         spans = list(module.write_spans())
         # The ledger also reserves six bytes at a fixed linked-unit base.
         spans.extend(('cave', unit.cave_addr, 6, f'linked unit {unit.label}')
@@ -394,6 +398,11 @@ def occupied_claims(registry=None):
 def test_occupied_claims():
     """Reject non-detour writes and the asserted tail beyond a shorter pad."""
     from remix.schema import Detour, Kind, Module, Poke
+    from remix.registry import modules
+    registered = modules()
+    assert "VOLUME MIXER" in registered
+    real = occupied_claims(registered)
+    assert real and all(item["module"] != "VOLUME MIXER" for item in real)
     addr = PINS['ui'][0]
     cases = [
         Module('probe-poke', 'PROBE POKE', Kind.CF_PATCH, 'synthetic overlap',
@@ -403,7 +412,7 @@ def test_occupied_claims():
     ]
     for module in cases:
         try:
-            occupied_claims({module.key: module})
+            occupied_claims({**registered, module.key: module})
         except AssertionError as exc:
             assert 'overlaps ui' in str(exc), str(exc)
         else:
@@ -585,8 +594,9 @@ def project_recorder_contract(model, project, out):
             report['required_behavior'] = (
                 'Defer the recorder-producing call at 0x40030ffc on REC1 press; '
                 'cancel saved press and release for MIXER. For a standalone '
-                'release replay saved press then release. This changes recording '
-                'start from press to release; no non-MIXER flush contract is proved.')
+                'release replay saved press then release for ONE/ONE2 only. HOLD must '
+                'retain native press/release timing and use MIDI+MIXER then RIGHT; '
+                'the running recorder gate qualifies actual durations and cleanup.')
             report['passed'] = True
     finally:
         out.mkdir(parents=True, exist_ok=True)
